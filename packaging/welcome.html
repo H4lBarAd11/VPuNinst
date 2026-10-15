@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<style>
+  /* Installer's pane follows the system appearance, as a native window does,
+     so the page takes the system's colours in both and sets only the house
+     ink in light mode. The system font, not DM Sans: this is native chrome. */
+  :root { color-scheme: light dark; }
+  body { font: 13px/1.45 -apple-system, sans-serif; margin: 0; }
+  @media (prefers-color-scheme: light) { body { color: #404040; } }
+  p { margin: 0 0 10px; }
+  ul { margin: 0 0 10px; padding-left: 18px; }
+  li { margin-bottom: 6px; }
+  code { font: 12px ui-monospace, Menlo, monospace; }
+  .note { opacity: 0.7; }
+</style>
+</head>
+<body>
+<p>VPuNinst is a small Mac app for the VPNs of the institutions you belong to, built
+on openconnect. It signs you in with each institution’s single sign-on in its
+own window, starts the tunnels with Touch ID, keeps them up, and can run several
+side by side.</p>
+
+<p>The installer asks for your administrator password once, and sets up five things:</p>
+<ul>
+  <li><b>VPuNinst</b>, in Applications.</li>
+  <li><b>Its helper</b>, in <code>/Library/PrivilegedHelperTools</code>. It runs as
+    root and can do only three things without your password: connect to an
+    institution on your list, disconnect, and undo what a dead tunnel left behind.</li>
+  <li><b>Its tunnel script</b>, beside the helper, which sets up each tunnel’s
+    routes and DNS without touching your network’s own settings.</li>
+  <li><b>openconnect</b>, built by VPuNinst from its published source with
+    OpenSSL, in a folder only root can change. Nothing else needs installing.</li>
+  <li><b>A sudoers rule</b> that lets you run the helper’s three steps without a
+    password. The app asks for Touch ID instead. Adding an institution to the
+    list still takes your password.</li>
+</ul>
+
+<p class="note">The README explains what that rule trades. VPuNinst is an independent
+project, not affiliated with any institution or VPN vendor; the next page is its
+disclaimer, which you are asked to agree to.</p>
+</body>
+</html>

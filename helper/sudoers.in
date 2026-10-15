@@ -1,0 +1,7 @@
+# VPuNinst — installed as /etc/sudoers.d/vpuninst, with @USER@ replaced.
+# Copyright (c) 2026 Riccardo Nevoso. GPL-3.0-or-later; see LICENSE.
+#
+# Lets the app run its helper without a password; the app asks for Touch ID
+# itself. Only these three verbs: add and remove are deliberately absent, so
+# changing the list of servers still takes your password.
+@USER@ ALL=(root) NOPASSWD: /Library/PrivilegedHelperTools/vpuninst-helper connect *, /Library/PrivilegedHelperTools/vpuninst-helper disconnect *, /Library/PrivilegedHelperTools/vpuninst-helper repair

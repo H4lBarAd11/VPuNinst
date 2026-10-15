@@ -1,0 +1,327 @@
+#!/bin/sh
+# vpuninst-helper — the root half of VPuNinst.
+# Copyright (c) 2026 Riccardo Nevoso. GPL-3.0-or-later; see LICENSE.
+#
+# Installed root:wheel 0755 in /Library/PrivilegedHelperTools. The app runs it
+# with `sudo -n`: a sudoers rule (helper/sudoers.in) lets connect, disconnect
+# and repair run without a password, and the app asks for Touch ID itself.
+# That makes Touch ID a courtesy, not a lock, so nothing here is free-form.
+# The servers openconnect may reach are a root-owned list that only `add` and
+# `remove` change, and those take the administrator's password: `connect`
+# names an institution on the list, never a server. The username and cookie
+# are validated, the cookie is read from stdin, and openconnect is VPuNinst's
+# own build (tools/build-openconnect.sh), installed where only root can change it.
+#
+#   connect <id> <user|-> <kind> [gateway]
+#                                 cookie on stdin; returns once the tunnel is up or failed.
+#                                 A Palo Alto portal's gateway: the portal's own
+#                                 server, or one of the gateways on its entry
+#   disconnect <id>               stop that institution's tunnel and undo its settings
+#   repair                        undo what tunnels that are no longer running left behind
+#   add <id> <vpn> <server> <option> <domains> <name> [gateways]
+#                                 add an institution to the list, or change one
+#   remove <id>                   disconnect an institution and take it off the list
+#
+# add and remove are not in the sudoers rule: they need the password, or
+# anything running as you could point openconnect at a server of its own and
+# have root apply that server's routes and DNS.
+
+set -u
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+export PATH
+
+# openconnect, its HIP script, and an empty OpenSSL config where the build
+# told OpenSSL to look for one (ssl/openssl.cnf), all installed root-owned.
+SNAP=/Library/PrivilegedHelperTools/vpuninst
+TUNNEL=/Library/PrivilegedHelperTools/vpuninst-tunnel
+# Tab-separated: id, vpn, server, option, DNS domains, name, and a Palo Alto
+# portal's gateways on other servers. Root-owned and readable by everyone:
+# the app shows it, only add and remove write it.
+LIST=/Library/PrivilegedHelperTools/vpuninst-institutions
+# Each tunnel's pid file and state (see vpuninst-tunnel). /var/run is emptied at
+# boot, as are the routes and network settings the state describes.
+RUN=/var/run/vpuninst
+
+# grep matches line by line, so a value with a newline in it would pass on
+# its first line alone, and an id is part of scutil commands run as root.
+NL='
+'
+valid() {   # <what> <value>
+  case "$2" in *"$NL"*) return 1 ;; esac
+  case "$1" in
+    id) printf '%s' "$2" | grep -qE '^[a-z0-9][a-z0-9-]{0,23}$' ;;
+    # openconnect's protocols with a web sign-in. Array Networks has none:
+    # openconnect signs in to it with a username and password only.
+    vpn) printf '%s' "$2" | grep -qxE 'gp|anyconnect|fortinet|nc|pulse|f5' ;;
+    # A host name or address, an optional port and an optional path.
+    server) [ ${#2} -le 255 ] &&
+      printf '%s' "$2" | grep -qE '^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:[0-9]{1,5})?(/[A-Za-z0-9._~%/-]*)?$' ;;
+    # Palo Alto: portal or gateway. Fortinet: the realm. Cisco: the group.
+    option) printf '%s' "$2" | grep -qE '^(-|[A-Za-z0-9._-]{1,64})$' ;;
+    domains) [ ${#2} -le 512 ] &&
+      printf '%s' "$2" | grep -qE '^(-|[A-Za-z0-9.-]+(,[A-Za-z0-9.-]+)*)$' ;;
+    # A gateway: a host name or address and an optional port.
+    gateway) [ ${#2} -le 255 ] &&
+      printf '%s' "$2" | grep -qE '^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:[0-9]{1,5})?$' ;;
+    gateways) [ ${#2} -le 1024 ] &&
+      printf '%s' "$2" | grep -qE '^(-|[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:[0-9]{1,5})?(,[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:[0-9]{1,5})?)*)$' ;;
+    # Free text for people to read; never a tab, a newline or any other control.
+    name) [ ${#2} -ge 1 ] && [ ${#2} -le 64 ] && ! printf '%s' "$2" | LC_ALL=C grep -q '[[:cntrl:]]' ;;
+    user) printf '%s' "$2" | grep -qE '^(-|[A-Za-z0-9._@+-]{1,128})$' ;;
+    kind) printf '%s' "$2" | grep -qxE 'prelogin-cookie|portal-userauthcookie|cookie' ;;
+    *) return 1 ;;
+  esac
+}
+
+usage() {
+  echo "usage: $0 connect <id> <user|-> <kind> [gateway] | disconnect <id> | repair | add <id> <vpn> <server> <option> <domains> <name> [gateways] | remove <id>" >&2
+  exit 64
+}
+
+# Reads an institution off the list into VPN, SERVER, OPTION, DOMAINS and
+# GATEWAYS, checked again here: the list is root's, but nothing reaches
+# openconnect unchecked.
+lookup() {
+  LINE=$(awk -F '\t' -v id="$1" '$1 == id { print; exit }' "$LIST" 2>/dev/null)
+  [ -n "$LINE" ] || return 1
+  VPN=$(printf '%s' "$LINE" | cut -f2)
+  SERVER=$(printf '%s' "$LINE" | cut -f3)
+  OPTION=$(printf '%s' "$LINE" | cut -f4)
+  DOMAINS=$(printf '%s' "$LINE" | cut -f5)
+  GATEWAYS=$(printf '%s' "$LINE" | cut -f7)
+  [ -n "$GATEWAYS" ] || GATEWAYS=-
+  valid vpn "$VPN" && valid server "$SERVER" && valid option "$OPTION" && valid domains "$DOMAINS" &&
+    valid gateways "$GATEWAYS"
+}
+
+# Whether a portal may send the tunnel to gateway $1: its own server, or one
+# added to its entry with the administrator's password.
+gateway_allowed() {
+  G=$(printf '%s' "$1" | tr 'A-Z' 'a-z')
+  [ "$G" = "$(printf '%s' "${SERVER%%/*}" | cut -d: -f1 | tr 'A-Z' 'a-z')" ] && return 0
+  printf '%s' "$GATEWAYS" | tr 'A-Z' 'a-z' | tr ',' '\n' | grep -qxF "$G"
+}
+
+# The pid of this institution's openconnect, if it is running. The pid file
+# alone isn't trusted, and neither is the name a process gives itself, which
+# any program can choose: the process must run as root, as the copy.
+oc_pid() {
+  P=$(head -1 "$RUN/$1.pid" 2>/dev/null)
+  printf '%s' "$P" | grep -qE '^[0-9]{1,7}$' || return 1
+  [ "$(ps -ww -p "$P" -o uid=,comm= 2>/dev/null | sed 's/^ *//')" = "0 $SNAP/openconnect" ] || return 1
+  echo "$P"
+}
+
+# One institution's tunnel is changed by one call at a time. A connect holds
+# the lock until openconnect has its pid file, so that a repair running
+# meanwhile (from the app's watcher, or a second copy of the app) doesn't take
+# a tunnel that is still coming up for one that died. A lock whose holder has
+# gone is taken over.
+lock() {
+  L="$RUN/$1.lock"
+  if ! mkdir "$L" 2>/dev/null; then
+    locked "$1" && return 1
+    rm -rf "$L"
+    mkdir "$L" 2>/dev/null || return 1
+  fi
+  echo $$ > "$L/pid"
+}
+locked() {
+  H=$(head -1 "$RUN/$1.lock/pid" 2>/dev/null)
+  printf '%s' "$H" | grep -qE '^[0-9]{1,7}$' && kill -0 "$H" 2>/dev/null
+}
+unlock() { rm -rf "$RUN/$1.lock"; }
+
+stop_openconnect() {
+  # --background ignores SIGTERM at times; escalate if it survives.
+  for SIG in INT TERM KILL; do
+    P=$(oc_pid "$1") || break
+    kill -"$SIG" "$P" 2>/dev/null
+    for _ in 1 2 3 4 5 6; do
+      oc_pid "$1" >/dev/null || break
+      sleep 0.5
+    done
+  done
+  rm -f "$RUN/$1.pid"
+}
+
+# Undoes what a tunnel set up, from what vpuninst-tunnel recorded when it did.
+# Only for a tunnel whose openconnect is no longer running.
+teardown() {
+  [ -x "$TUNNEL" ] || return 0
+  reason=vpuninst-teardown VPUNINST_ID="$1" "$TUNNEL"
+}
+
+repair() {
+  for F in "$RUN"/*.state; do
+    [ -e "$F" ] || continue
+    ID=$(basename "$F" .state)
+    valid id "$ID" || continue
+    locked "$ID" || oc_pid "$ID" >/dev/null || teardown "$ID"
+  done
+  # Settings whose record is gone. A tunnel's own keys are named for it, so
+  # nothing else on the Mac is touched.
+  for K in $(echo "list State:/Network/Service/vpuninst-[a-z0-9-]*/(IPv4|DNS)" | scutil | awk '/State:/ { print $NF }'); do
+    ID=$(printf '%s' "$K" | sed -n 's|^State:/Network/Service/vpuninst-\([a-z0-9-]*\)/.*$|\1|p')
+    valid id "$ID" || continue
+    locked "$ID" || oc_pid "$ID" >/dev/null || teardown "$ID"
+  done
+  return 0
+}
+
+# Owned by root, and writable by no one else.
+root_owned() {
+  [ -e "$1" ] && [ "$(stat -f %u "$1")" -eq 0 ] || return 1
+  case "$(stat -f %Lp "$1")" in *[2367]? | *[2367]) return 1 ;; esac
+}
+
+# Everything connect runs as root, in place and root's alone.
+ready() {
+  root_owned "$SNAP" && root_owned "$SNAP/ssl" || return 1
+  [ -x "$SNAP/openconnect" ] && root_owned "$SNAP/openconnect" || return 1
+  [ -x "$SNAP/hipreport.sh" ] && root_owned "$SNAP/hipreport.sh" || return 1
+  [ -f "$SNAP/ssl/openssl.cnf" ] && root_owned "$SNAP/ssl/openssl.cnf" || return 1
+  [ -x "$TUNNEL" ] && root_owned "$TUNNEL"
+}
+
+case "${1:-}" in
+  connect)
+    [ $# -eq 4 ] || [ $# -eq 5 ] || usage
+    ID=$2; USERNAME=$3; KIND=$4; GW=${5:-}
+    valid id "$ID" || { echo "bad institution id" >&2; exit 64; }
+    lookup "$ID" || { echo "\"$ID\" isn't on the list of institutions" >&2; exit 66; }
+    valid user "$USERNAME" || { echo "bad username" >&2; exit 64; }
+    valid kind "$KIND" || { echo "bad cookie kind" >&2; exit 64; }
+    if [ -n "$GW" ]; then
+      valid gateway "$GW" || { echo "bad gateway" >&2; exit 64; }
+      [ "$VPN:$OPTION" = gp:portal ] || { echo "only a Palo Alto portal sends the tunnel to a gateway" >&2; exit 64; }
+      gateway_allowed "$GW" || { echo "$GW isn't one of this portal's gateways on the list" >&2; exit 64; }
+    fi
+    IFS= read -r COOKIE || true
+    # Length in the shell: BSD grep rejects repeat counts above 255.
+    [ ${#COOKIE} -ge 8 ] && [ ${#COOKIE} -le 8192 ] || { echo "bad cookie length ${#COOKIE}" >&2; exit 65; }
+    # Each protocol's cookie in the exact shape openconnect takes it. It
+    # splits a cookie at ';' and then at the first '=', so only F5's, which
+    # is two cookies, may hold a ';'.
+    case "$VPN" in
+      gp) SHAPE='^[A-Za-z0-9._~+/=%-]+$' ;;
+      anyconnect) SHAPE='^webvpn=[A-Za-z0-9@+/=]+$' ;;
+      fortinet) SHAPE='^SVPNCOOKIE=[A-Za-z0-9+/=%]+$' ;;
+      nc) SHAPE='^DSID=[A-Za-z0-9]+$' ;;
+      pulse) SHAPE='^[A-Za-z0-9]+$' ;;
+      f5) SHAPE='^MRHSession=[A-Za-z0-9]+; F5_ST=[0-9z]+$' ;;
+    esac
+    printf '%s' "$COOKIE" | grep -qE "$SHAPE" || { echo "bad cookie for $VPN" >&2; exit 65; }
+    ready || { echo "openconnect or its files aren't installed where only root can change them; install VPuNinst again" >&2; exit 70; }
+
+    # Each protocol takes the sign-in its own way. Palo Alto's is a password
+    # in place of the user's, the others a session cookie.
+    set -- --protocol="$VPN" --non-inter --background --pid-file="$RUN/$ID.pid" \
+      --reconnect-timeout=3600 --script="$TUNNEL" --no-system-trust --cafile="$RUN/$ID.ca.pem"
+    case "$VPN" in
+      gp)
+        # Through a portal's gateway, the tunnel goes to that gateway, signed
+        # in with its own cookie or with the one the portal handed out for it.
+        GROUP=$OPTION
+        if [ -n "$GW" ]; then GROUP=gateway; SERVER=$GW; fi
+        case "$OPTION:$GROUP:$KIND" in
+          portal:portal:prelogin-cookie|portal:portal:portal-userauthcookie|gateway:gateway:prelogin-cookie) ;;
+          portal:gateway:prelogin-cookie|portal:gateway:portal-userauthcookie) ;;
+          *) echo "a $KIND doesn't sign in to a Palo Alto $GROUP" >&2; exit 64 ;;
+        esac
+        [ "$USERNAME" != - ] || { echo "Palo Alto needs the username" >&2; exit 64; }
+        set -- "$@" --user="$USERNAME" --usergroup="$GROUP:$KIND" --passwd-on-stdin \
+          --csd-wrapper="$SNAP/hipreport.sh"
+        ;;
+      *)
+        [ "$KIND" = cookie ] || { echo "$VPN signs in with a cookie" >&2; exit 64; }
+        set -- "$@" --cookie-on-stdin
+        # Cisco's session is asked for with this agent's name (see the app's
+        # SignIn.swift), and the tunnel is set up with the same one.
+        [ "$VPN" = anyconnect ] && set -- "$@" --useragent="AnyConnect-compatible OpenConnect VPN Agent"
+        ;;
+    esac
+
+    mkdir -p "$RUN" && chmod 0755 "$RUN"
+    lock "$ID" || { echo "\"$ID\" is being changed by another call" >&2; exit 75; }
+    trap 'unlock "$ID"' EXIT
+    # What openconnect trusts: macOS's own root certificates, from a keychain
+    # only the system can change, read again at each connect so that they
+    # follow the system's updates. Nothing the user can write is trusted.
+    # A file per institution, since two can connect at once; read before the
+    # old tunnel is touched, so a failure here leaves it as it was.
+    CA="$RUN/$ID.ca.pem"
+    security find-certificate -a -p /System/Library/Keychains/SystemRootCertificates.keychain > "$CA.new" &&
+      grep -q 'BEGIN CERTIFICATE' "$CA.new" && chmod 0644 "$CA.new" && mv -f "$CA.new" "$CA" ||
+      { rm -f "$CA.new"; echo "couldn't read macOS's root certificates" >&2; exit 1; }
+    stop_openconnect "$ID"
+    teardown "$ID"
+    # In a root-only directory: in /tmp, anything running as you could plant
+    # a symlink under this name and have root truncate and chmod another file.
+    # The last session's log is kept: once reconnected, it is the only record
+    # of why that tunnel ended.
+    LOG="/var/log/vpuninst-$ID.log"
+    [ -f "$LOG" ] && mv -f "$LOG" "$LOG.1"
+    : > "$LOG"
+    chmod 644 "$LOG"
+    # --background returns once the tunnel is established. The long
+    # reconnect timeout is what keeps it up across Wi-Fi changes and sleep.
+    # OPENSSL_CONF names the empty config the build also points OpenSSL at.
+    # VPUNINST_ID and VPUNINST_DOMAINS reach vpuninst-tunnel.
+    printf '%s\n' "$COOKIE" | VPUNINST_ID="$ID" VPUNINST_DOMAINS="$DOMAINS" \
+      OPENSSL_CONF="$SNAP/ssl/openssl.cnf" \
+      "$SNAP/openconnect" "$@" "$SERVER" >>"$LOG" 2>&1
+    RC=$?
+    if [ $RC -ne 0 ]; then
+      stop_openconnect "$ID"
+      teardown "$ID"
+    fi
+    exit $RC
+    ;;
+  disconnect)
+    [ $# -eq 2 ] && valid id "$2" || usage
+    mkdir -p "$RUN" && chmod 0755 "$RUN"
+    lock "$2" || { echo "\"$2\" is being changed by another call" >&2; exit 75; }
+    trap 'unlock "$2"' EXIT
+    stop_openconnect "$2"
+    teardown "$2"
+    # Only the openconnect just stopped read it; connect writes it afresh.
+    rm -f "$RUN/$2.ca.pem"
+    ;;
+  repair)
+    repair
+    ;;
+  add)
+    [ $# -eq 7 ] || [ $# -eq 8 ] || usage
+    GWS=${8:--}
+    valid id "$2" || { echo "bad institution id" >&2; exit 64; }
+    valid vpn "$3" || { echo "unknown VPN protocol \"$3\"" >&2; exit 64; }
+    valid server "$4" || { echo "bad server address" >&2; exit 64; }
+    valid option "$5" || { echo "bad option" >&2; exit 64; }
+    valid domains "$6" || { echo "bad DNS domains" >&2; exit 64; }
+    valid name "$7" || { echo "bad name" >&2; exit 64; }
+    valid gateways "$GWS" || { echo "bad gateways" >&2; exit 64; }
+    [ "$GWS" = - ] || [ "$3:$5" = gp:portal ] || { echo "only a Palo Alto portal has gateways" >&2; exit 64; }
+    # A changed server takes effect at the next connect, so the tunnel ends now.
+    stop_openconnect "$2"
+    teardown "$2"
+    {
+      [ -f "$LIST" ] && awk -F '\t' -v id="$2" '$1 != id' "$LIST"
+      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$2" "$3" "$4" "$5" "$6" "$7" "$GWS"
+    } > "$LIST.new" || exit 1
+    chown root:wheel "$LIST.new" && chmod 0644 "$LIST.new" && mv -f "$LIST.new" "$LIST"
+    ;;
+  remove)
+    [ $# -eq 2 ] && valid id "$2" || usage
+    stop_openconnect "$2"
+    teardown "$2"
+    if [ -f "$LIST" ]; then
+      awk -F '\t' -v id="$2" '$1 != id' "$LIST" > "$LIST.new" || exit 1
+      chown root:wheel "$LIST.new" && chmod 0644 "$LIST.new" && mv -f "$LIST.new" "$LIST"
+    fi
+    rm -f "/var/log/vpuninst-$2.log" "/var/log/vpuninst-$2.log.1" "$RUN/$2.ca.pem"
+    ;;
+  *)
+    usage
+    ;;
+esac

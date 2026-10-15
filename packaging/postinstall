@@ -1,0 +1,54 @@
+#!/bin/sh
+# VPuNinst — run as root by Installer once the app is in /Applications.
+# Copyright (c) 2026 Riccardo Nevoso. GPL-3.0-or-later; see LICENSE.
+#
+# The README's root steps, for the person logged in at the screen: install the
+# helper, its tunnel script and VPuNinst's own openconnect where only root can
+# change them, start an empty list of institutions if there is none yet, and
+# write the sudoers rule. Output goes to /var/log/install.log; a failure here is
+# Installer's "The installation failed".
+set -eu
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+export PATH
+HERE=$(dirname "$0")
+DIR=/Library/PrivilegedHelperTools
+LIST=$DIR/vpuninst-institutions
+
+# $3 is the volume being installed on. The helper, its copy of openconnect
+# and the rule belong to the running system, never to another disk.
+[ "${3:-}" = / ] || { echo "VPuNinst installs on the startup disk only" >&2; exit 1; }
+
+# Installer runs this as root, so $USER says nothing about whom the rule is for.
+U=$(stat -f %Su /dev/console)
+case "$U" in
+  root|loginwindow|_mbsetupuser|"") echo "no one is logged in at the screen to write the rule for" >&2; exit 1 ;;
+esac
+# A short name that sudoers takes as it is, with nothing in it that sed or
+# sudoers would read as syntax.
+printf '%s' "$U" | grep -qE '^[A-Za-z0-9_][A-Za-z0-9._-]*$' || { echo "can't write a sudoers rule for \"$U\"" >&2; exit 1; }
+
+install -o root -g wheel -m 0755 "$HERE/vpuninst-helper" "$DIR/vpuninst-helper"
+install -o root -g wheel -m 0755 "$HERE/vpuninst-tunnel" "$DIR/vpuninst-tunnel"
+# openconnect and its HIP script, and the empty OpenSSL config the build points
+# OpenSSL at. Assembled beside the old folder and swapped in whole: a tunnel
+# running through the update keeps the copy it started from.
+NEW=$DIR/vpuninst.new
+rm -rf "$NEW"
+install -d -o root -g wheel -m 0755 "$NEW" "$NEW/ssl"
+install -o root -g wheel -m 0755 "$HERE/openconnect" "$HERE/hipreport.sh" "$NEW/"
+install -o root -g wheel -m 0644 /dev/null "$NEW/ssl/openssl.cnf"
+rm -rf "$DIR/vpuninst"
+mv "$NEW" "$DIR/vpuninst"
+# An update keeps the institutions already added.
+if [ ! -f "$LIST" ]; then
+  : > "$LIST"
+  chown root:wheel "$LIST"
+  chmod 0644 "$LIST"
+fi
+
+T=$(mktemp)
+trap 'rm -f "$T"' EXIT
+sed "s/@USER@/$U/" "$HERE/sudoers.in" > "$T"
+visudo -cf "$T" >/dev/null
+install -o root -g wheel -m 0440 "$T" /etc/sudoers.d/vpuninst
+echo "VPuNinst: helper and openconnect installed, sudoers rule written for $U"

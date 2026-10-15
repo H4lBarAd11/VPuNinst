@@ -1,0 +1,374 @@
+#!/bin/sh
+# Copyright (c) 2026 Riccardo Nevoso. GPL-3.0-or-later; see LICENSE.
+# vpuninst-tunnel — sets up and takes down one tunnel. openconnect runs it as root
+# (--script, in place of the usual vpnc-script) with the tunnel's details in
+# its environment, and vpuninst-helper runs it to undo a tunnel that died.
+#
+# Several tunnels run side by side, so each one touches only what is its own:
+#   - routes to its ranges through its own utun, which go when the utun goes;
+#   - a host route to its gateway through the network's router, so the
+#     tunnel's packets don't try to travel inside it;
+#   - its DNS servers, for its own domains only, as a supplemental resolver
+#     under its own key. The network's DNS is never written: vpnc-script
+#     writes the tunnel's servers into it and empties it on disconnect, which
+#     undoes another tunnel's DNS and, with a tunnel that dies mid-way, leaves
+#     the Mac's DNS broken.
+# What it set up is recorded in /var/run/vpuninst/<id>.state, readable by the
+# app, step by step as it goes, so that it can be undone exactly, by this
+# script or after a crash.
+#
+# The values come from the gateway, and one gateway is not trusted with
+# another tunnel's traffic. Each value is checked before it reaches route,
+# ifconfig or scutil (a newline in a domain name would otherwise be an scutil
+# command of the gateway's choosing), and globbing is off, so a value like *
+# is never matched against files. Of what overlaps another tunnel:
+#   - an identical range or domain stays with the tunnel that had it first;
+#   - a more specific range wins, as routing has it, and the app is told, so
+#     that the tunnel it takes addresses from says so;
+#   - each tunnel's DNS servers are held by host routes into its own utun,
+#     which nothing more specific can take, and its domains can't be claimed
+#     again, or narrowed, by another;
+#   - a range kept out of the tunnel is only honoured inside the tunnel's own
+#     ranges and outside every other tunnel's: it can't send another tunnel's
+#     traffic out onto the network.
+
+set -u
+set -f
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+export PATH
+RUN=/var/run/vpuninst
+
+# grep matches line by line, so a value with a newline in it would pass on
+# its first line alone. Every check starts by turning those away.
+NL='
+'
+line() { case "$1" in "" | *"$NL"*) return 1 ;; esac; }
+ipv4() {
+  line "$1" && printf '%s' "$1" | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}$' &&
+    printf '%s' "$1" | awk -F. '{ exit !($1 <= 255 && $2 <= 255 && $3 <= 255 && $4 <= 255) }'
+}
+ipv6() { line "$1" && case "$1" in *:*) printf '%s' "$1" | grep -qE '^[0-9A-Fa-f:.]{2,45}$' ;; *) return 1 ;; esac; }
+masklen() { line "$1" && printf '%s' "$1" | grep -qE '^[0-9]{1,3}$' && [ "$1" -le "$2" ]; }
+# A name with at least two labels: a single one (com, local) would answer
+# for a whole top-level domain, or for the Mac's own .local names.
+domain() {
+  line "$1" && printf '%s' "$1" | grep -qE '^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$'
+}
+
+ID=${VPUNINST_ID:-}
+line "$ID" && printf '%s' "$ID" | grep -qE '^[a-z0-9][a-z0-9-]{0,23}$' || { echo "vpuninst-tunnel: no institution" >&2; exit 1; }
+STATE="$RUN/$ID.state"
+KEY="State:/Network/Service/vpuninst-$ID"
+
+# The network's own router: the first default route not through a tunnel.
+# macOS keeps a scoped default route for each interface, so it is found even
+# when a tunnel has taken over the main one.
+router4() {
+  netstat -rn -f inet | awk '$1 == "default" && $NF !~ /^utun/ && $2 ~ /^[0-9.]+$/ { print $2; exit }'
+}
+router6() {
+  netstat -rn -f inet6 | awk '$1 == "default" && $NF !~ /^(utun|lo)/ {
+    g = $2; if (g ~ /^fe[89ab]/ && g !~ /%/) g = g "%" $NF; print g; exit }'
+}
+
+get() { sed -n "s/^$1=//p" "$STATE" 2>/dev/null | head -1; }
+
+flush_dns() {
+  dscacheutil -flushcache
+  killall -HUP mDNSResponder 2>/dev/null
+}
+
+# What the other tunnels recorded under a field, one value per line.
+others() {   # <field>
+  set +f
+  for F in "$RUN"/*.state; do
+    [ -e "$F" ] && [ "$F" != "$STATE" ] || continue
+    sed -n "s/^$1=//p" "$F" | tr ' ' '\n'
+  done | grep -v '^$'
+  set -f
+}
+
+# Whether another tunnel recorded this value under this field.
+shared() { others "$1" | grep -qxF "$2"; }
+
+# Whether IPv4 range $2 (a.b.c.d/len) stands in relation $1 to any of the
+# ranges on stdin: "inside" one, "overlap" one without being identical, or
+# "touch" one, identical included. IPv6 ranges are passed over. One awk for
+# the lot: a tunnel can bring dozens of ranges, and openconnect waits.
+cidr() {   # <inside|overlap|touch> <net/len>
+  awk -v mode="$1" -v a="$2" '
+    function n(ip,  p) { split(ip, p, "."); return ((p[1] * 256 + p[2]) * 256 + p[3]) * 256 + p[4] }
+    function within(x, xl, y, yl,  s) { if (xl + 0 < yl + 0) return 0; s = 2 ^ (32 - yl); return int(n(x) / s) == int(n(y) / s) }
+    BEGIN { split(a, A, "/") }
+    /:/ || !/\// { next }
+    { split($0, B, "/")
+      in1 = within(A[1], A[2], B[1], B[2]); in2 = within(B[1], B[2], A[1], A[2])
+      if ((mode == "inside" && in1) || (mode == "overlap" && $0 != a && (in1 || in2)) ||
+          (mode == "touch" && (in1 || in2))) { found = 1; exit } }
+    END { exit !found }'
+}
+
+# Whether IPv4 range $1 lies inside one of this tunnel's own ranges.
+ours() { [ "$FULL" = 1 ] || printf '%s\n' $INCS | cidr inside "$1"; }
+
+# A host route to the gateway through the network's router.
+gateway_route() {
+  G=${VPNGATEWAY:-}
+  case "$G" in 127.*|::1|"") return 0 ;; esac
+  if ipv4 "$G"; then
+    R=$(router4)
+    [ -n "$R" ] || return 0
+    route -n delete -host "$G" >/dev/null 2>&1
+    route -n add -host "$G" "$R" >/dev/null && GATEWAY=$G
+  elif ipv6 "$G"; then
+    R=$(router6)
+    [ -n "$R" ] || return 0
+    route -n delete -inet6 -host "$G" >/dev/null 2>&1
+    route -n add -inet6 -host "$G" "$R" >/dev/null && GATEWAY=$G
+  fi
+  ROUTER=${R:-}
+}
+
+# A range into the tunnel. One another tunnel already holds can't be added:
+# it is recorded as a clash, and that tunnel keeps it. One this tunnel already
+# holds (a session set up again) is simply its own. One that overlaps another
+# tunnel's without being identical is added, and recorded as an overlap.
+into_tunnel() {   # <net/len> [-inet6]
+  if route -n add ${2:-} -net "$1" -interface "$TUNDEV" >/dev/null 2>&1 ||
+     route -n get ${2:-} -net "$1" 2>/dev/null | grep -qx " *interface: $TUNDEV"; then
+    ROUTES="$ROUTES $1"
+    [ -n "${2:-}" ] && return 0
+    printf '%s\n' $OTHER_ROUTES | cidr overlap "$1" && OVERLAP="$OVERLAP $1"
+  else
+    CLASH="$CLASH $1"
+  fi
+}
+
+# A range kept out of the tunnel, through the network's router: only inside
+# this tunnel's own ranges and outside every other tunnel's. One another
+# tunnel already keeps out the same way is shared.
+past_tunnel() {   # <net/len>
+  ours "$1" || return 0
+  printf '%s\n' $OTHER_ROUTES | cidr touch "$1" && return 0
+  R=$(router4)
+  [ -n "$R" ] || return 0
+  if route -n add -net "$1" "$R" >/dev/null 2>&1 ||
+     route -n get -net "$1" 2>/dev/null | grep -qx " *gateway: $R"; then
+    EXCLUDES="$EXCLUDES $1"
+  fi
+}
+
+write_state() {
+  mkdir -p "$RUN" && chmod 0755 "$RUN"
+  cat > "$STATE.new" <<EOF
+PHASE=$1
+TUNDEV=$TUNDEV
+ADDRESS=$ADDRESS
+GATEWAY=$GATEWAY
+ROUTER=$ROUTER
+FULL=$FULL
+ROUTES=$(echo $ROUTES)
+EXCLUDES=$(echo $EXCLUDES)
+CLASH=$(echo $CLASH)
+OVERLAP=$(echo $OVERLAP)
+DNS=$(echo $DNS)
+DOMAINS=$(echo $DOMAINS)
+TAKEN=$(echo $TAKEN)
+EOF
+  chmod 0644 "$STATE.new" && mv -f "$STATE.new" "$STATE"
+}
+
+set_phase() {
+  [ -f "$STATE" ] || return 0
+  sed "s/^PHASE=.*/PHASE=$1/" "$STATE" > "$STATE.new" && chmod 0644 "$STATE.new" && mv -f "$STATE.new" "$STATE"
+}
+
+connect() {
+  TUNDEV=${TUNDEV:-}
+  line "$TUNDEV" && printf '%s' "$TUNDEV" | grep -qE '^utun[0-9]{1,3}$' || { echo "vpuninst-tunnel: bad tunnel device" >&2; exit 1; }
+  ADDRESS=${INTERNAL_IP4_ADDRESS:-}
+  ipv4 "$ADDRESS" || { echo "vpuninst-tunnel: no IPv4 address for the tunnel" >&2; exit 1; }
+  MTU=${INTERNAL_IP4_MTU:-1412}
+  line "$MTU" && printf '%s' "$MTU" | grep -qE '^[0-9]{3,4}$' && [ "$MTU" -ge 576 ] && [ "$MTU" -le 9000 ] || MTU=1412
+  GATEWAY="" ROUTER="" ROUTES="" EXCLUDES="" CLASH="" OVERLAP="" DNS="" DOMAINS="" TAKEN="" FULL=0 INCS=""
+  OTHER_ROUTES=$(others ROUTES)
+
+  # Recorded from the first change on, so that a step that fails, or a kill
+  # half-way, leaves a record to undo it from.
+  gateway_route
+  write_state starting
+  ifconfig "$TUNDEV" inet "$ADDRESS" "$ADDRESS" netmask 255.255.255.255 mtu "$MTU" up || exit 1
+  V6=${INTERNAL_IP6_NETMASK:-}
+  [ -n "$V6" ] || { [ -n "${INTERNAL_IP6_ADDRESS:-}" ] && V6="$INTERNAL_IP6_ADDRESS/128"; }
+  if ipv6 "${V6%/*}" && masklen "${V6##*/}" 128; then
+    ifconfig "$TUNDEV" inet6 "$V6" mtu "$MTU" up
+  else
+    V6=""
+  fi
+
+  # The ranges in, read first: ranges kept out are judged against them.
+  # Without a list of ranges in, every range goes in: two halves of the
+  # address space, which beat the default route without replacing it and go
+  # with the utun.
+  count() { line "$1" && printf '%s' "$1" | grep -qE '^[0-9]{1,4}$' && echo "$1" || echo 0; }
+  EXC=$(count "${CISCO_SPLIT_EXC:-0}") INC=$(count "${CISCO_SPLIT_INC:-0}")
+  INC6=$(count "${CISCO_IPV6_SPLIT_INC:-0}")
+  I=0
+  if [ "$INC" -gt 0 ]; then
+    while [ "$I" -lt "$INC" ]; do
+      eval "N=\${CISCO_SPLIT_INC_${I}_ADDR:-} L=\${CISCO_SPLIT_INC_${I}_MASKLEN:-}"
+      if [ "$N" = 0.0.0.0 ]; then
+        FULL=1
+      elif ipv4 "$N" && masklen "$L" 32; then
+        INCS="$INCS $N/$L"
+      fi
+      I=$((I + 1))
+    done
+  else
+    FULL=1
+  fi
+  NET=${INTERNAL_IP4_NETADDR:-} LEN=${INTERNAL_IP4_NETMASKLEN:-}
+  if ipv4 "$NET" && masklen "$LEN" 31; then INCS="$INCS $NET/$LEN"; fi
+
+  I=0
+  while [ "$I" -lt "$EXC" ]; do
+    eval "N=\${CISCO_SPLIT_EXC_${I}_ADDR:-} L=\${CISCO_SPLIT_EXC_${I}_MASKLEN:-}"
+    case "$N" in 0.*|127.*|169.254.*) ;; *) ipv4 "$N" && masklen "$L" 32 && past_tunnel "$N/$L" ;; esac
+    I=$((I + 1))
+  done
+  write_state starting
+  for C in $INCS; do into_tunnel "$C"; done
+  if [ $FULL = 1 ]; then
+    into_tunnel 0.0.0.0/1
+    into_tunnel 128.0.0.0/1
+  fi
+  if [ -n "$V6" ]; then
+    I=0
+    if [ "$INC6" -gt 0 ]; then
+      while [ "$I" -lt "$INC6" ]; do
+        eval "N=\${CISCO_IPV6_SPLIT_INC_${I}_ADDR:-} L=\${CISCO_IPV6_SPLIT_INC_${I}_MASKLEN:-}"
+        if ipv6 "$N" && masklen "$L" 128; then
+          if [ "$L" -eq 0 ]; then into_tunnel ::/1 -inet6; into_tunnel 8000::/1 -inet6
+          else into_tunnel "$N/$L" -inet6; fi
+        fi
+        I=$((I + 1))
+      done
+    else
+      into_tunnel ::/1 -inet6
+      into_tunnel 8000::/1 -inet6
+    fi
+  fi
+
+  # DNS. Each server inside the tunnel's own ranges is held by a host route
+  # into its utun, so that a more specific range from another tunnel can't
+  # draw its queries elsewhere.
+  for A in ${INTERNAL_IP4_DNS:-} ${INTERNAL_IP6_DNS:-}; do
+    if ipv4 "$A"; then
+      DNS="$DNS $A"
+      ours "$A/32" && into_tunnel "$A/32"
+    elif ipv6 "$A"; then
+      DNS="$DNS $A"
+    fi
+  done
+  # The gateway names its domains; the institution's entry can add more. A
+  # value with a newline in it is dropped whole, not split into names. A
+  # domain another tunnel answers for, or one inside it, stays with that tunnel.
+  OTHER_DOMAINS=$(others DOMAINS)
+  for V in "${CISCO_DEF_DOMAIN:-}" "${CISCO_SPLIT_DNS:-}" "${VPUNINST_DOMAINS:-}"; do
+    case "$V" in *"$NL"*) continue ;; esac
+    for D in $(printf '%s' "$V" | tr ',' ' '); do
+      [ "$D" = - ] && continue
+      domain "$D" || continue
+      D=$(printf '%s' "$D" | tr 'A-Z' 'a-z')
+      case " $DOMAINS $TAKEN " in *" $D "*) continue ;; esac
+      for O in $OTHER_DOMAINS; do
+        case "$D" in "$O" | *".$O") TAKEN="$TAKEN $D"; continue 2 ;; esac
+      done
+      DOMAINS="$DOMAINS $D"
+    done
+  done
+  write_state starting
+  # A tunnel that carries everything also answers every name: its service
+  # becomes the primary one, as vpnc-script makes it. One that carries only
+  # its ranges answers only its domains, and the network's DNS the rest.
+  # Without a domain, its DNS goes unused: the app says so.
+  if [ $FULL = 1 ]; then PRIMARY="d.add Router $ADDRESS
+d.add OverridePrimary # 1"; else PRIMARY=""; fi
+  if [ -n "$DNS" ] && { [ $FULL = 1 ] || [ -n "$DOMAINS" ]; }; then
+    MATCH=""
+    [ $FULL = 1 ] || MATCH="d.add SupplementalMatchDomains *$DOMAINS"
+    FIRST=$(echo $DOMAINS | cut -d' ' -f1)
+    scutil >/dev/null <<EOF
+d.init
+d.add ServerAddresses *$DNS
+${FIRST:+d.add DomainName $FIRST}
+${DOMAINS:+d.add SearchDomains *$DOMAINS}
+$MATCH
+set $KEY/DNS
+quit
+EOF
+  fi
+  scutil >/dev/null <<EOF
+d.init
+d.add Addresses * $ADDRESS
+d.add SubnetMasks * 255.255.255.255
+d.add InterfaceName $TUNDEV
+$PRIMARY
+set $KEY/IPv4
+quit
+EOF
+  flush_dns
+  write_state up
+}
+
+# Everything a tunnel set up that outlives its utun: its network settings,
+# the route to its gateway and the ranges it kept out. Ranges into the utun go
+# with it, and deleting them here could take another tunnel's identical range.
+teardown() {
+  scutil >/dev/null <<EOF
+remove $KEY/DNS
+remove $KEY/IPv4
+quit
+EOF
+  G=$(get GATEWAY)
+  if [ -n "$G" ] && ! shared GATEWAY "$G"; then
+    if ipv4 "$G"; then route -n delete -host "$G" >/dev/null 2>&1
+    elif ipv6 "$G"; then route -n delete -inet6 -host "$G" >/dev/null 2>&1; fi
+  fi
+  for N in $(get EXCLUDES); do
+    ipv4 "${N%/*}" || continue
+    shared EXCLUDES "$N" || route -n delete -net "$N" >/dev/null 2>&1
+  done
+  rm -f "$STATE"
+  flush_dns
+}
+
+case "${reason:-}" in
+  pre-init) ;;
+  connect) connect ;;
+  disconnect|vpuninst-teardown) teardown ;;
+  # Before each attempt to re-establish the session: the network may have
+  # changed, so the gateway's route and the ranges kept out are pointed at
+  # the router of the moment.
+  attempt-reconnect)
+    if [ -f "$STATE" ]; then
+      GATEWAY=$(get GATEWAY) ROUTER=""
+      VPNGATEWAY=${GATEWAY:-${VPNGATEWAY:-}}
+      gateway_route
+      R=$(router4)
+      if [ -n "$R" ]; then
+        for N in $(get EXCLUDES); do
+          ipv4 "${N%/*}" || continue
+          route -n delete -net "$N" >/dev/null 2>&1
+          route -n add -net "$N" "$R" >/dev/null 2>&1
+        done
+      fi
+      ROUTER=$(printf '%s' "$ROUTER" | tr -cd '0-9A-Fa-f.:%a-z')
+      sed -e "s/^PHASE=.*/PHASE=reconnecting/" -e "s/^ROUTER=.*/ROUTER=$ROUTER/" "$STATE" > "$STATE.new" &&
+        chmod 0644 "$STATE.new" && mv -f "$STATE.new" "$STATE"
+    fi
+    ;;
+  reconnect) set_phase up ;;
+  *) echo "vpuninst-tunnel: unknown reason \"${reason:-}\"" >&2; exit 1 ;;
+esac
+exit 0

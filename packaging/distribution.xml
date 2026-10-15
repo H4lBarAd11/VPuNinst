@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- VPuNinst — what Installer shows and checks. build.sh pkg fills in @VERSION@. -->
+<installer-gui-script minSpecVersion="2">
+    <title>VPuNinst</title>
+    <welcome file="welcome.html" mime-type="text/html"/>
+    <!-- Shown as the licence: Installer asks to agree to it before going on. -->
+    <license file="license.html" mime-type="text/html"/>
+    <conclusion file="conclusion.html" mime-type="text/html"/>
+    <!-- The flake, faint, at the bottom left (tools/make-assets.swift). -->
+    <background file="background.png" mime-type="image/png" alignment="bottomleft" scaling="none"/>
+    <background-darkAqua file="background.png" mime-type="image/png" alignment="bottomleft" scaling="none"/>
+    <!-- Apple silicon and Intel, the startup disk only: the helper and its
+         rule belong to the running system. -->
+    <options customize="never" hostArchitectures="arm64,x86_64"/>
+    <domains enable_localSystem="true" enable_currentUserHome="false" enable_anywhere="false"/>
+    <allowed-os-versions><os-version min="14.0"/></allowed-os-versions>
+
+    <choices-outline>
+        <line choice="app"/>
+    </choices-outline>
+    <choice id="app" title="VPuNinst" visible="false">
+        <pkg-ref id="io.github.h4lbarad11.vpuninst.pkg"/>
+    </choice>
+    <pkg-ref id="io.github.h4lbarad11.vpuninst.pkg" version="@VERSION@" onConclusion="none">app.pkg</pkg-ref>
+</installer-gui-script>

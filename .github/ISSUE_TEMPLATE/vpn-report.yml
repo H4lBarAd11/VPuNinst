@@ -1,0 +1,87 @@
+name: VPN report
+description: Say how VPuNinst went with your institution's VPN, whether it worked or not.
+title: "VPN report: "
+labels: ["help wanted"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Only Palo Alto Networks has been tried against a real gateway so far, so every report helps, including one that says it simply worked.
+
+        **Before pasting a log**, replace the institution's host names with `vpn.example.edu`, your username with `user`, and addresses with something like `10.x.x.x`. Keep the error messages as they are. Leave out the server's address if you'd rather keep it private.
+  - type: dropdown
+    id: vpn
+    attributes:
+      label: VPN
+      description: The kind you chose when adding the institution.
+      options:
+        - Palo Alto Networks, portal
+        - Palo Alto Networks, gateway
+        - Cisco
+        - Fortinet
+        - Juniper
+        - Ivanti (Pulse)
+        - F5
+    validations:
+      required: true
+  - type: dropdown
+    id: result
+    attributes:
+      label: How far it got
+      options:
+        - "It worked: the tunnel came up and the institution's addresses and names answered"
+        - The tunnel came up, but something didn't work (addresses, names, reconnecting)
+        - The sign-in finished, but the tunnel didn't come up
+        - The sign-in didn't finish
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did and what you saw, step by step. Mention MFA, a group or realm, or anything unusual in the institution's instructions.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: VPuNinst version
+      description: At the foot of the window.
+      placeholder: "2.0"
+    validations:
+      required: true
+  - type: input
+    id: macos
+    attributes:
+      label: macOS version
+      placeholder: "15.5"
+    validations:
+      required: true
+  - type: dropdown
+    id: mac
+    attributes:
+      label: Mac
+      options:
+        - Apple silicon
+        - Intel
+    validations:
+      required: true
+  - type: textarea
+    id: app-log
+    attributes:
+      label: The app's log
+      description: The last lines of `~/Library/Logs/VPuNinst.log` around the attempt.
+      render: text
+  - type: textarea
+    id: openconnect-log
+    attributes:
+      label: openconnect's log
+      description: "`/var/log/vpuninst-<id>.log`, or `.log.1` if you have reconnected since."
+      render: text
+  - type: checkboxes
+    id: redacted
+    attributes:
+      label: Before posting
+      options:
+        - label: I have replaced host names, my username and addresses in anything I pasted.
+          required: true

@@ -1,0 +1,16 @@
+name: Idea
+description: Something VPuNinst could do, or do better.
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: need
+    attributes:
+      label: What you need
+      description: The situation it would help with, in your own words.
+    validations:
+      required: true
+  - type: textarea
+    id: how
+    attributes:
+      label: How it could work
+      description: Optional. Any idea of what it would look like in the app.

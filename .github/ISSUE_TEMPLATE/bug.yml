@@ -1,0 +1,85 @@
+name: Bug
+description: Something in VPuNinst doesn't work as it should.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        A security problem goes in a [private report](https://github.com/H4lBarAd11/VPuNinst/security/advisories/new), not here.
+
+        **Before pasting a log**, replace the institution's host names with `vpn.example.edu`, your username with `user`, and addresses with something like `10.x.x.x`. Keep the error messages as they are.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: How to make it happen again
+      placeholder: |
+        1. Connect an institution
+        2. Turn Wi-Fi off and on
+        3. …
+  - type: dropdown
+    id: vpn
+    attributes:
+      label: VPN
+      description: The kind of the institution involved, if it's about one.
+      options:
+        - Not about one VPN
+        - Palo Alto Networks, portal
+        - Palo Alto Networks, gateway
+        - Cisco
+        - Fortinet
+        - Juniper
+        - Ivanti (Pulse)
+        - F5
+  - type: input
+    id: version
+    attributes:
+      label: VPuNinst version
+      description: At the foot of the window.
+      placeholder: "2.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: install
+    attributes:
+      label: Installed from
+      options:
+        - The package
+        - Source
+    validations:
+      required: true
+  - type: input
+    id: macos
+    attributes:
+      label: macOS version
+      placeholder: "15.5"
+    validations:
+      required: true
+  - type: dropdown
+    id: mac
+    attributes:
+      label: Mac
+      options:
+        - Apple silicon
+        - Intel
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: The relevant lines of `~/Library/Logs/VPuNinst.log` and, for a tunnel, `/var/log/vpuninst-<id>.log`.
+      render: text
+  - type: checkboxes
+    id: redacted
+    attributes:
+      label: Before posting
+      options:
+        - label: I have replaced host names, my username and addresses in anything I pasted.
+          required: true

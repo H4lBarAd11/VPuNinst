@@ -88,6 +88,10 @@ final class Tunnels: ObservableObject {
     private var pingMisses: [String: Int] = [:]
     /// Whether the installed openconnect has been compared with the app's.
     private var checkedOpenconnect = false
+    /// When the watcher last asked repair to take tunnels' DNS servers out of
+    /// a network's settings. Should that fail, it asks again once a minute,
+    /// not on every look.
+    private var lastDNSRepair = Date.distantPast
 
     init() {
         keepConnected = UserDefaults.standard.object(forKey: "keepConnected") as? Bool ?? true
@@ -202,7 +206,14 @@ final class Tunnels: ObservableObject {
         }
 
         let stale = await Task.detached { Probe.leftovers() }.value
-        if !stale.isEmpty, helperReady, busy.isEmpty { await repair() }
+        // Looked at every time, with or without a tunnel: a network's saved
+        // DNS outlives restarts, and anything can change it.
+        let stranded = await Task.detached { Probe.strandedDNS() }.value
+        let dnsDue = !stranded.isEmpty && Date().timeIntervalSince(lastDNSRepair) > 60
+        if !stale.isEmpty || dnsDue, helperReady, busy.isEmpty {
+            if dnsDue { lastDNSRepair = Date() }
+            await repair()
+        }
         for id in dropped where wanted.contains(id) && keepConnected && self[id].state == .disconnected {
             let name = list.first { $0.id == id }?.name ?? id
             update(id) { $0.problem = "The \(name) session ended. Signing in again to reconnect." }
@@ -256,6 +267,9 @@ final class Tunnels: ObservableObject {
                 update(id) { $0.state = .disconnected }
                 return
             }
+            // The sign-in starts by looking up the gateway, which a network
+            // whose saved DNS only a tunnel answers would fail.
+            if !(await Task.detached { Probe.strandedDNS() }.value).isEmpty { await repair() }
             do {
                 let r = try await SignIn.start(i)
                 // Removed or disconnected while the gateway was asked.
@@ -393,7 +407,28 @@ final class Tunnels: ObservableObject {
 
     func repair() async {
         let r = await Task.detached { Helper.call(["repair"]) }.value
-        if r.status != 0 { problem = explain(r, id: nil, fallback: "Couldn’t undo what a tunnel left behind.") }
+        // Each network whose DNS settings lost a tunnel's servers is named,
+        // with the institutions those servers belong to.
+        let lines: [[Substring]] = r.out.split(separator: Character("\n")).map { line in
+            line.split(separator: Character("\t"), omittingEmptySubsequences: false)
+        }
+        let healed = lines.filter { $0.count == 3 && $0[0] == "dns" }
+        let owners: [String: Set<String>] = healed.isEmpty ? [:] : await Task.detached { Probe.tunnelDNS() }.value
+        var notes: [String] = healed.map { f in
+            let servers = f[2].split(separator: Character(" ")).map(String.init)
+            let names = institutions.filter { i in
+                servers.contains { owners[i.id]?.contains($0.lowercased()) == true }
+            }.map(\.name)
+            let only = switch names.count {
+            case 0: "a tunnel reaches"
+            case 1: "\(names[0])’s tunnel reaches"
+            default: "the tunnels of \(ListFormatter.localizedString(byJoining: names)) reach"
+            }
+            return "Took \(ListFormatter.localizedString(byJoining: servers)) out of \(f[1])’s DNS settings. "
+                + "Only \(only) them, so off the tunnel no name could be looked up."
+        }
+        if r.status != 0 { notes.append(explain(r, id: nil, fallback: "Couldn’t undo what a tunnel left behind.")) }
+        if !notes.isEmpty { problem = notes.joined(separator: "\n\n") }
     }
 
     // MARK: - The list

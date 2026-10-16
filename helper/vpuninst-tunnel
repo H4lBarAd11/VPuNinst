@@ -15,7 +15,10 @@
 #     the Mac's DNS broken.
 # What it set up is recorded in /var/run/vpuninst/<id>.state, readable by the
 # app, step by step as it goes, so that it can be undone exactly, by this
-# script or after a crash.
+# script or after a crash. Its DNS servers that only the tunnel reaches are
+# also kept, across restarts, in /var/db/vpuninst/<id>.dns: saved in a
+# network's own DNS settings, such a server makes every name fail once the
+# tunnel is down, and the helper's repair takes it out.
 #
 # The values come from the gateway, and one gateway is not trusted with
 # another tunnel's traffic. Each value is checked before it reaches route,
@@ -37,6 +40,7 @@ set -f
 PATH=/usr/bin:/bin:/usr/sbin:/sbin
 export PATH
 RUN=/var/run/vpuninst
+DB=/var/db/vpuninst
 
 # grep matches line by line, so a value with a newline in it would pass on
 # its first line alone. Every check starts by turning those away.
@@ -158,6 +162,27 @@ past_tunnel() {   # <net/len>
   fi
 }
 
+# The DNS servers only this tunnel reaches, added to those it named before:
+# one inside its own ranges, or a private address, which no network outside
+# the institution answers. A public one answers from anywhere, so it is left
+# out, and with it any server a user picked for themselves.
+remember_dns() {
+  KEEP=""
+  for A in $DNS; do
+    if ipv4 "$A"; then
+      { [ "$FULL" = 0 ] && ours "$A/32"; } ||
+        printf '%s\n' 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 | cidr inside "$A/32" || continue
+    else
+      case "$A" in [Ff][CcDd][0-9A-Fa-f][0-9A-Fa-f]:*) ;; *) continue ;; esac
+    fi
+    KEEP="$KEEP $A"
+  done
+  [ -n "$KEEP" ] || return 0
+  mkdir -p "$DB" && chmod 0755 "$DB" || return 0
+  { cat "$DB/$ID.dns" 2>/dev/null; printf '%s\n' $KEEP; } | tr 'A-F' 'a-f' | sort -u | tail -n 32 > "$DB/$ID.dns.new" &&
+    chmod 0644 "$DB/$ID.dns.new" && mv -f "$DB/$ID.dns.new" "$DB/$ID.dns"
+}
+
 write_state() {
   mkdir -p "$RUN" && chmod 0755 "$RUN"
   cat > "$STATE.new" <<EOF
@@ -270,6 +295,7 @@ connect() {
       DNS="$DNS $A"
     fi
   done
+  remember_dns
   # The gateway names its domains; the institution's entry can add more. A
   # value with a newline in it is dropped whole, not split into names. A
   # domain another tunnel answers for, or one inside it, stays with that tunnel.

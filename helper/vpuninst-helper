@@ -17,7 +17,8 @@
 #                                 A Palo Alto portal's gateway: the portal's own
 #                                 server, or one of the gateways on its entry
 #   disconnect <id>               stop that institution's tunnel and undo its settings
-#   repair                        undo what tunnels that are no longer running left behind
+#   repair                        undo what tunnels that are no longer running left behind,
+#                                 and take tunnels' DNS servers out of networks' own settings
 #   add <id> <vpn> <server> <option> <domains> <name> [gateways]
 #                                 add an institution to the list, or change one
 #   remove <id>                   disconnect an institution and take it off the list
@@ -41,6 +42,10 @@ LIST=/Library/PrivilegedHelperTools/vpuninst-institutions
 # Each tunnel's pid file and state (see vpuninst-tunnel). /var/run is emptied at
 # boot, as are the routes and network settings the state describes.
 RUN=/var/run/vpuninst
+# Each institution's DNS servers that only its tunnel reaches, one per line,
+# written by vpuninst-tunnel. Kept across restarts: what they are for outlives
+# one, since a network's own settings do.
+DB=/var/db/vpuninst
 
 # grep matches line by line, so a value with a newline in it would pass on
 # its first line alone, and an id is part of scutil commands run as root.
@@ -68,6 +73,9 @@ valid() {   # <what> <value>
     # Free text for people to read; never a tab, a newline or any other control.
     name) [ ${#2} -ge 1 ] && [ ${#2} -le 64 ] && ! printf '%s' "$2" | LC_ALL=C grep -q '[[:cntrl:]]' ;;
     user) printf '%s' "$2" | grep -qE '^(-|[A-Za-z0-9._@+-]{1,128})$' ;;
+    # A DNS server: IPv4, or IPv6 with an optional zone.
+    address) [ ${#2} -le 64 ] &&
+      printf '%s' "$2" | grep -qE '^(([0-9]{1,3}\.){3}[0-9]{1,3}|[0-9A-Fa-f.]*:[0-9A-Fa-f:.]*(%[A-Za-z0-9]+)?)$' ;;
     kind) printf '%s' "$2" | grep -qxE 'prelogin-cookie|portal-userauthcookie|cookie' ;;
     *) return 1 ;;
   esac
@@ -152,6 +160,56 @@ teardown() {
   reason=vpuninst-teardown VPUNINST_ID="$1" "$TUNNEL"
 }
 
+# A network's own DNS settings (System Settings, Network, the network's
+# Details, DNS) holding a server only a tunnel reaches: once that tunnel is
+# down, every name fails on that network, the gateway's own included, so the
+# tunnel can't come back up either. A VPN client that writes its servers in
+# at connect and takes them out only at a clean disconnect leaves them there
+# whenever its tunnel dies. Only servers an institution's tunnel recorded are
+# taken out; any other server saved there stays, and a network left with
+# none goes back to the ones its router hands out. Each change is printed for
+# the app, tab-separated: dns, the network, the servers taken out.
+heal_dns() {
+  KNOWN=$(cat "$DB"/*.dns 2>/dev/null | while IFS= read -r A; do
+    valid address "$A" && printf '%s\n' "$A"; done | tr 'A-F' 'a-f' | sort -u)
+  [ -n "$KNOWN" ] || return 0
+  known() { printf '%s\n' "$KNOWN" | grep -qxF "$(printf '%s' "$1" | tr 'A-F' 'a-f')"; }
+  # Networks as networksetup names them, which is how it takes them back: a
+  # note first, then one per line, a disabled one marked with a leading *.
+  networksetup -listallnetworkservices 2>/dev/null | tail -n +2 | {
+    RC=0
+    set -f
+    while IFS= read -r S; do
+      S=${S#\*}
+      [ -n "$S" ] || continue
+      # One server per line. Anything else, such as the sentence saying
+      # there are none, leaves the network as it is.
+      SAVED=$(networksetup -getdnsservers "$S" 2>/dev/null) || continue
+      KEEP="" GONE=""
+      for A in $SAVED; do
+        valid address "$A" || continue 2
+        if known "$A"; then GONE="$GONE $A"; else KEEP="$KEEP $A"; fi
+      done
+      [ -n "$GONE" ] || continue
+      networksetup -setdnsservers "$S" ${KEEP:-Empty} >/dev/null 2>&1
+      # Reported once the network no longer has them, not on the say-so of
+      # the command that took them out.
+      NOW=$(networksetup -getdnsservers "$S" 2>/dev/null)
+      LEFT=""
+      for A in $GONE; do
+        printf '%s\n' "$NOW" | tr 'A-F' 'a-f' | grep -qxF "$(printf '%s' "$A" | tr 'A-F' 'a-f')" && LEFT="$LEFT $A"
+      done
+      if [ -n "$LEFT" ]; then
+        echo "couldn't take$LEFT out of the DNS settings of $S" >&2
+        RC=1
+      else
+        printf 'dns\t%s\t%s\n' "$S" "$(echo $GONE)"
+      fi
+    done
+    exit $RC
+  }
+}
+
 repair() {
   for F in "$RUN"/*.state; do
     [ -e "$F" ] || continue
@@ -166,7 +224,7 @@ repair() {
     valid id "$ID" || continue
     locked "$ID" || oc_pid "$ID" >/dev/null || teardown "$ID"
   done
-  return 0
+  heal_dns
 }
 
 # Owned by root, and writable by no one else.
@@ -319,7 +377,10 @@ case "${1:-}" in
       awk -F '\t' -v id="$2" '$1 != id' "$LIST" > "$LIST.new" || exit 1
       chown root:wheel "$LIST.new" && chmod 0644 "$LIST.new" && mv -f "$LIST.new" "$LIST"
     fi
-    rm -f "/var/log/vpuninst-$2.log" "/var/log/vpuninst-$2.log.1" "$RUN/$2.ca.pem"
+    # Its servers are taken out of networks' settings while they are still
+    # known to be its.
+    heal_dns >/dev/null
+    rm -f "/var/log/vpuninst-$2.log" "/var/log/vpuninst-$2.log.1" "$RUN/$2.ca.pem" "$DB/$2.dns"
     ;;
   *)
     usage

@@ -52,8 +52,9 @@ while a tunnel is up, dimmed while none is. When a session ends, the app
 signs in again, and while the single sign-on is still valid that skips MFA.
 
 **Leaves your network alone.** It never writes your Wi-Fi’s DNS, which is
-what leaves a Mac unable to look anything up after a VPN dies, and it
-removes whatever a dead tunnel left behind.
+what leaves a Mac unable to look anything up after a VPN dies. It removes
+whatever a dead tunnel left behind, and takes out of your networks’ DNS
+settings any server only an institution’s tunnel reaches, whoever put it there.
 
 </td>
 </tr>
@@ -257,7 +258,7 @@ release, and `packaging/release.sh` won’t publish without the latest.
 To undo everything, delete VPuNinst from Applications, then:
 
 ```sh
-sudo rm -r /etc/sudoers.d/vpuninst /Library/PrivilegedHelperTools/vpuninst-* /Library/PrivilegedHelperTools/vpuninst
+sudo rm -rf /etc/sudoers.d/vpuninst /Library/PrivilegedHelperTools/vpuninst-* /Library/PrivilegedHelperTools/vpuninst /var/db/vpuninst
 sudo pkgutil --forget io.github.h4lbarad11.vpuninst.pkg   # if it came from the package
 ```
 
@@ -268,7 +269,8 @@ sudo pkgutil --forget io.github.h4lbarad11.vpuninst.pkg   # if it came from the 
  ───────────                        ──────────────────────────────────
  sign-in page → cookie  ─────────►  connect <id> …   cookie on stdin → openconnect --background
  watch: pid files + tunnel state    disconnect <id>  stop that openconnect, undo its settings
- a dead tunnel’s leftovers? ─────►  repair           undo what dead tunnels left behind
+ a dead tunnel’s leftovers? ─────►  repair           undo what dead tunnels left behind,
+ a tunnel’s DNS in a network? ───►                   take tunnels’ DNS out of networks’ settings
                                     openconnect ──►  vpuninst-tunnel: routes, DNS, a record of both
 ```
 
@@ -285,7 +287,9 @@ sudo pkgutil --forget io.github.h4lbarad11.vpuninst.pkg   # if it came from the 
 The list of institutions is `/Library/PrivilegedHelperTools/vpuninst-institutions`,
 one per line, with the gateways on other servers each portal may send its
 tunnel to. Each running tunnel has a pid file and a record of what it set
-up in `/var/run/vpuninst/`.
+up in `/var/run/vpuninst/`. Each institution’s DNS servers that only its
+tunnel reaches are kept in `/var/db/vpuninst/<id>.dns`, across restarts, so
+that repair can take them out of a network’s DNS settings.
 
 Logs: `~/Library/Logs/VPuNinst.log` for the app (exit codes and errors, never a
 cookie or a password) and `/var/log/vpuninst-<id>.log` for each institution’s
@@ -317,6 +321,12 @@ one down undoes exactly that:
   whose gateway names no domain has its DNS unused until you add the domains
   to the institution; the window says so. A DNS filter that answers every
   query itself needs a rule sending each institution’s domains to its servers.
+  A tunnel’s server saved in a network’s own DNS settings (some VPN clients
+  write theirs there and take them out only when the tunnel ends cleanly)
+  makes every name fail once the tunnel is down, the gateway’s included, so
+  the tunnel can’t come back either. VPuNinst takes such a server out as
+  soon as it sees it, and says so. Only servers a tunnel named, and that
+  nothing but a tunnel reaches, are touched; any other DNS you set stays.
 - **A tunnel that carries everything.** Some institutions send all traffic
   through their tunnel. Such a tunnel also answers every name. Only one of
   them can do that at a time, beside any number of the others.

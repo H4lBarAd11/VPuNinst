@@ -182,6 +182,35 @@ enum Probe {
         return ids.filter { tunnel($0).pid == nil }.sorted()
     }
 
+    /// Each institution's DNS servers that only its tunnel reaches, as
+    /// vpuninst-tunnel recorded them, lowercased.
+    static func tunnelDNS() -> [String: Set<String>] {
+        let db = "/var/db/vpuninst"
+        let files = (try? FileManager.default.contentsOfDirectory(atPath: db)) ?? []
+        var known: [String: Set<String>] = [:]
+        for f in files where f.hasSuffix(".dns") {
+            let text = (try? String(contentsOfFile: "\(db)/\(f)", encoding: .utf8)) ?? ""
+            known[String(f.dropLast(4))] = Set(text.split(separator: "\n").map { $0.lowercased() })
+        }
+        return known
+    }
+
+    /// Those servers, where a network has saved them as its own DNS. Off the
+    /// tunnel they answer nothing, so no name can be looked up there, not
+    /// even the gateway's. The helper's repair takes them out.
+    static func strandedDNS() -> Set<String> {
+        let known = tunnelDNS().values.reduce(into: Set<String>()) { $0.formUnion($1) }
+        guard !known.isEmpty, let store = SCDynamicStoreCreate(nil, Brand.name as CFString, nil, nil),
+              let keys = SCDynamicStoreCopyKeyList(store, "Setup:/Network/Service/[^/]+/DNS" as CFString) as? [String]
+        else { return [] }
+        var saved = Set<String>()
+        for k in keys {
+            let dns = SCDynamicStoreCopyValue(store, k as CFString) as? [String: Any]
+            saved.formUnion((dns?["ServerAddresses"] as? [String] ?? []).map { $0.lowercased() })
+        }
+        return known.intersection(saved)
+    }
+
     /// Round-trip through the tunnel, in milliseconds: a single ICMP echo to
     /// the first DNS server the gateway named, which is reachable only through
     /// the tunnel. nil if nothing comes back within two seconds, which is also

@@ -44,6 +44,10 @@ final class Tunnels: ObservableObject {
     /// The sign-in on show, and those waiting their turn.
     @Published private(set) var signIn: SignInRequest?
     private var queue: [SignInRequest] = []
+    /// Each sign-in's page, from its first load to its end: the one on show,
+    /// and one loading out of sight. Those waiting their turn get theirs when
+    /// shown.
+    private var pages: [UUID: SignInWebView.Page] = [:]
     @Published private(set) var helperReady = Helper.isInstalled && Helper.passwordless
     @Published var keepConnected: Bool {
         didSet { UserDefaults.standard.set(keepConnected, forKey: "keepConnected") }
@@ -258,7 +262,8 @@ final class Tunnels: ObservableObject {
     /// skips Touch ID, since the sign-in that follows needs you anyway.
     func connect(_ id: String, auto: Bool = false) {
         guard helperReady, let i = institutions.first(where: { $0.id == id }),
-              signIn?.institution.id != id, !queue.contains(where: { $0.institution.id == id }) else { return }
+              signIn?.institution.id != id, !queue.contains(where: { $0.institution.id == id }),
+              !pages.values.contains(where: { $0.request.institution.id == id }) else { return }
         wanted.insert(id)
         update(id) { $0.problem = nil; $0.state = .signingIn }
         Task {
@@ -284,30 +289,58 @@ final class Tunnels: ObservableObject {
 
     private func showNextSignIn() {
         guard signIn == nil, !queue.isEmpty else { return }
-        signIn = queue.removeFirst()
+        let r = queue.removeFirst()
+        if pages[r.id] == nil { pages[r.id] = page(r) }
+        signIn = r
         bringForward()
+    }
+
+    func page(for r: SignInRequest) -> SignInWebView.Page? { pages[r.id] }
+
+    /// `outOfSight` loads the page without showing it, until it waits for you.
+    private func page(_ r: SignInRequest, outOfSight: Bool = false) -> SignInWebView.Page {
+        SignInWebView.Page(request: r, remember: rememberPassword,
+                           done: { [weak self] c in self?.signedIn(r, c) },
+                           failed: { [weak self] m in self?.signInFailed(r, m) },
+                           needsYou: outOfSight ? { [weak self] in self?.show(r) } : nil)
+    }
+
+    /// A sign-in loading out of sight that waits for you takes its turn in the sheet.
+    private func show(_ r: SignInRequest) {
+        guard pages[r.id] != nil else { return }
+        AppLog.write("sign-in to \(r.institution.id)\(r.gateway.map { " at \($0)" } ?? "") waits for you: shown")
+        queue.append(r)
+        showNextSignIn()
+    }
+
+    /// A sign-in is over: its page goes, and its turn in the sheet with it.
+    /// false when it was over already.
+    private func end(_ r: SignInRequest) -> Bool {
+        guard let p = pages.removeValue(forKey: r.id) else { return false }
+        p.close()
+        queue.removeAll { $0.id == r.id }
+        if signIn?.id == r.id { signIn = nil }
+        return true
     }
 
     /// The sheet was closed without signing in.
     func cancelSignIn() {
         guard let r = signIn else { return }
-        signIn = nil
+        _ = end(r)
         wanted.remove(r.institution.id)
         update(r.institution.id) { $0.state = .disconnected }
         showNextSignIn()
     }
 
     func signInFailed(_ r: SignInRequest, _ message: String) {
-        guard signIn?.id == r.id else { return }
-        signIn = nil
+        guard end(r) else { return }
         wanted.remove(r.institution.id)
         update(r.institution.id) { $0.state = .disconnected; $0.problem = message }
         showNextSignIn()
     }
 
     func signedIn(_ r: SignInRequest, _ c: Credential) {
-        guard signIn?.id == r.id else { return }
-        signIn = nil
+        guard end(r) else { return }
         showNextSignIn()
         let id = r.institution.id
         let user = c.username.flatMap { $0.isEmpty ? nil : $0 } ?? "-"
@@ -345,8 +378,9 @@ final class Tunnels: ObservableObject {
             }
             let next = try await SignIn.gateway(i, g)
             guard self[id].state == .signingIn else { return }
-            queue.append(next)
-            showNextSignIn()
+            // The identity provider usually still knows you from the portal's
+            // sign-in, so this one ends by itself: it is shown only if not.
+            pages[next.id] = page(next, outOfSight: true)
         } catch {
             fail(error.localizedDescription)
         }
@@ -448,10 +482,15 @@ final class Tunnels: ObservableObject {
         if let e = Helper.admin(["remove", i.id], prompt: "\(Brand.name) wants to remove \(i.name) from the VPNs it may connect to.") {
             return e
         }
+        // A sign-in loading out of sight leaves the window free for this.
+        for p in pages.values where p.request.institution.id == i.id { _ = end(p.request) }
+        queue.removeAll { $0.institution.id == i.id }
+        showNextSignIn()
         wanted.remove(i.id)
         status[i.id] = nil
         institutions = Institution.load()
         let store = i.dataStoreID
+        SignInWebView.release(i)
         Task.detached(priority: .utility) { SavedLogin.forget(i.id) }
         Task { try? await WKWebsiteDataStore.remove(forIdentifier: store) }
         return nil

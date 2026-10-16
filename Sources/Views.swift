@@ -492,10 +492,8 @@ struct LoginSheet: View {
             .padding(.horizontal, 18).padding(.vertical, 12)
             .background(Theme.ivory)
             Rectangle().fill(Theme.hairline).frame(height: 1)
-            if let r = vpn.signIn {
-                SignInWebView(request: r, remember: vpn.rememberPassword,
-                              done: { c in vpn.signedIn(r, c) },
-                              failed: { m in vpn.signInFailed(r, m) })
+            if let r = vpn.signIn, let page = vpn.page(for: r) {
+                SignInWebView(page: page)
                     // A new sign-in is a new page, not this one updated.
                     .id(r.id)
             }

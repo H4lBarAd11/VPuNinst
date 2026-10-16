@@ -294,13 +294,9 @@ enum SignIn {
     }
 }
 
+/// The sheet's view of a sign-in's page.
 struct SignInWebView: NSViewRepresentable {
-    let request: SignInRequest
-    let remember: Bool
-    let done: (Credential) -> Void
-    let failed: (String) -> Void
-
-    func makeCoordinator() -> Coordinator { Coordinator(request: request, remember: remember, done: done, failed: failed) }
+    let page: Page
 
     /// The capture and fill scripts run in a world of their own: they see the
     /// page, but the page's own scripts can't see them, or post to them.
@@ -317,44 +313,50 @@ struct SignInWebView: NSViewRepresentable {
     }, true);
     """
 
-    func makeNSView(context: Context) -> WKWebView {
-        let cfg = WKWebViewConfiguration()
-        cfg.websiteDataStore = WKWebsiteDataStore(forIdentifier: request.institution.dataStoreID)
-        if remember {
-            cfg.userContentController.addUserScript(
-                WKUserScript(source: Self.capture, injectionTime: .atDocumentEnd, forMainFrameOnly: true, in: Self.world))
-            cfg.userContentController.add(context.coordinator, contentWorld: Self.world, name: "vpuninstLogin")
-        }
-        let v = WKWebView(frame: .zero, configuration: cfg)
-        v.navigationDelegate = context.coordinator
-        if let html = request.html {
-            v.loadHTMLString(html, baseURL: request.url)
-        } else if let u = request.url {
-            v.load(URLRequest(url: u))
-        }
-        return v
+    /// Each institution's data store, made once and kept while the app runs.
+    /// WebKit keeps a store's session cookies only while something holds the
+    /// store, and an identity provider's session is usually one of them: with
+    /// a store per sheet, the sign-in at the gateway a portal sends the tunnel
+    /// to would ask for the password again, seconds after the portal's.
+    private static var stores: [UUID: WKWebsiteDataStore] = [:]
+
+    static func store(_ i: Institution) -> WKWebsiteDataStore {
+        let id = i.dataStoreID
+        if let s = stores[id] { return s }
+        let s = WKWebsiteDataStore(forIdentifier: id)
+        stores[id] = s
+        return s
     }
+
+    /// Lets go of an institution's store; WebKit deletes only one not in use.
+    static func release(_ i: Institution) { stores[i.dataStoreID] = nil }
+
+    func makeNSView(context: Context) -> WKWebView { page.view }
 
     func updateNSView(_ v: WKWebView, context: Context) {}
 
-    // The content controller holds its message handler strongly; let it go
-    // with the sheet.
-    static func dismantleNSView(_ v: WKWebView, coordinator: Coordinator) {
-        v.configuration.userContentController.removeAllScriptMessageHandlers()
-    }
-
-    final class Coordinator: NSObject, WKNavigationDelegate, WKScriptMessageHandler {
+    /// A sign-in's page: the web view and what watches it, from the first
+    /// load to the credential. It outlives the sheet's view of it, so a
+    /// sign-in can load out of sight and be shown as it stands once it waits
+    /// for you.
+    @MainActor
+    final class Page: NSObject, WKNavigationDelegate, WKScriptMessageHandler {
         let request: SignInRequest
+        let view: WKWebView
         let remember: Bool
         let done: (Credential) -> Void
         let failed: (String) -> Void
         var finished = false
-        /// Submitted once per sheet: if the form comes back (a changed
+        /// Set while the page loads out of sight: called, once, when it waits
+        /// for you.
+        private var needsYou: (() -> Void)?
+        private var waiting: Task<Void, Never>?
+        /// Submitted once per sign-in: if the form comes back (a changed
         /// password), it is filled but left for you, so it can't loop.
         var submitted = false
         /// Cisco's token, from the moment its cookie appears.
         var token: String?
-        /// The saved sign-in, read once per sheet and off the main thread.
+        /// The saved sign-in, read once per sign-in and off the main thread.
         /// After a rebuild the keychain asks before handing it over, and read
         /// on the main thread that froze the whole app until the dialog was
         /// answered. Read once, a sign-in that loads several pages asks once.
@@ -362,12 +364,78 @@ struct SignInWebView: NSViewRepresentable {
 
         private var institution: Institution { request.institution }
 
+        /// How long a sign-in out of sight may go on before it is shown
+        /// anyway. One that ends by itself takes a second or two.
+        private static let patience: Duration = .seconds(6)
+
+        /// With `needsYou`, the page loads out of sight until it waits for you.
         init(request: SignInRequest, remember: Bool, done: @escaping (Credential) -> Void,
-             failed: @escaping (String) -> Void) {
+             failed: @escaping (String) -> Void, needsYou: (() -> Void)? = nil) {
             self.request = request
             self.remember = remember
             self.done = done
             self.failed = failed
+            self.needsYou = needsYou
+            let cfg = WKWebViewConfiguration()
+            cfg.websiteDataStore = SignInWebView.store(request.institution)
+            if remember {
+                cfg.userContentController.addUserScript(WKUserScript(
+                    source: SignInWebView.capture, injectionTime: .atDocumentEnd, forMainFrameOnly: true, in: SignInWebView.world))
+            }
+            // The sheet's size, so a page out of sight is laid out as it would be shown.
+            view = WKWebView(frame: NSRect(x: 0, y: 0, width: 520, height: 595), configuration: cfg)
+            super.init()
+            if remember {
+                view.configuration.userContentController.add(self, contentWorld: SignInWebView.world, name: "vpuninstLogin")
+            }
+            view.navigationDelegate = self
+            if let html = request.html {
+                view.loadHTMLString(html, baseURL: request.url)
+            } else if let u = request.url {
+                view.load(URLRequest(url: u))
+            }
+            if needsYou != nil {
+                waiting = Task { [weak self] in
+                    guard (try? await Task.sleep(for: Self.patience)) != nil else { return }
+                    self?.reveal()
+                }
+            }
+        }
+
+        /// Ends the page: nothing more is reported, and the message handler,
+        /// which the content controller holds strongly, is let go.
+        func close() {
+            finished = true
+            needsYou = nil
+            waiting?.cancel()
+            view.navigationDelegate = nil
+            view.configuration.userContentController.removeAllScriptMessageHandlers()
+        }
+
+        /// Shows a page that was loading out of sight, once.
+        private func reveal() {
+            guard !finished, let n = needsYou else { return }
+            needsYou = nil
+            waiting?.cancel()
+            n()
+        }
+
+        /// A page out of sight is shown once it stays put with something on it
+        /// to fill in or press. Half a second on, a page that sends itself
+        /// onwards, as those between a sign-in's two ends do, is loading the next.
+        private func lookForYou(_ w: WKWebView) {
+            let page = w.url
+            Task { [weak self, weak w] in
+                try? await Task.sleep(for: .milliseconds(500))
+                guard let self, let w, self.needsYou != nil, !w.isLoading, w.url == page else { return }
+                let js = """
+                Array.prototype.some.call(document.querySelectorAll('input:not([type=hidden]), select, textarea, button'),
+                  function (e) { return e.getClientRects().length > 0 && getComputedStyle(e).visibility !== 'hidden'; })
+                """
+                w.evaluateJavaScript(js, in: nil, in: SignInWebView.world) { [weak self] res in
+                    if case .success(let v) = res, (v as? Bool) == true { self?.reveal() }
+                }
+            }
         }
 
         private func savedLogin() async -> SavedLogin.Login? {
@@ -394,12 +462,19 @@ struct SignInWebView: NSViewRepresentable {
             }
         }
 
+        /// Only a page that asks for a password reads the saved one: after a
+        /// rebuild the keychain asks first, and a sign-in that ends by itself,
+        /// out of sight, shouldn't make it ask.
         private func fill(_ w: WKWebView) {
             guard remember, let page = w.url, page.scheme == "https" else { return }
-            Task { @MainActor [weak w] in
-                // The page may have moved on while the keychain was asked.
-                guard let l = await savedLogin(), let w, w.url == page, page.host == l.host else { return }
-                fill(w, with: l)
+            let asks = "document.querySelector('input[type=password]') !== null"
+            w.evaluateJavaScript(asks, in: nil, in: SignInWebView.world) { [weak self, weak w] res in
+                guard case .success(let v) = res, (v as? Bool) == true else { return }
+                Task { @MainActor in
+                    // The page may have moved on while the keychain was asked.
+                    guard let self, let l = await self.savedLogin(), let w, w.url == page, page.host == l.host else { return }
+                    self.fill(w, with: l)
+                }
             }
         }
 
@@ -467,6 +542,7 @@ struct SignInWebView: NSViewRepresentable {
         func webView(_ w: WKWebView, didFinish nav: WKNavigation!) {
             fill(w)
             check(w)
+            if needsYou != nil { lookForYou(w) }
         }
 
         // Cisco's final address need not be a page that loads.

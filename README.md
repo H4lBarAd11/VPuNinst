@@ -131,7 +131,8 @@ Press **Add institution…** and give it:
   a portal, **Gateway** if they call it a gateway. Through a portal, VPuNinst
   asks it for its gateways and connects to the best one, signing in to that
   gateway too when the portal hands out no cookie for it; the second sign-in
-  goes through the same identity provider and usually ends by itself. A
+  goes through the same identity provider and usually ends by itself, out of
+  sight: its window appears only if it waits for you. A
   gateway on another server than the portal’s is added to the institution the
   first time the portal names it, with your administrator password. **Group**
   (Cisco) and **Realm** (Fortinet), only if the instructions name one.

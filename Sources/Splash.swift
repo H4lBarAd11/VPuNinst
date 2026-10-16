@@ -14,6 +14,12 @@ import SwiftUI
 // The main window is kept unseen until the hand-over. Launch only: opening
 // the window again from the menu bar is instant, as it should be.
 //
+// It plays where the window is. Opened from a full-screen app, the window
+// lands on a desktop, since a full-screen space holds its own app alone: the
+// splash first takes you there, as switching to the app does, and plays once
+// you have arrived. Played where you were, it would open out to a window
+// that isn't there.
+//
 // The pane is the window itself, drawn from the real one while it is still
 // unseen. A plain pane in the window's colours, the first version, read
 // against an ivory app behind as an empty, clear window for the quarter
@@ -32,6 +38,10 @@ enum Splash {
     // Reduce Motion: the mark shown whole, faded in and out, nothing turning or
     // growing. The effect is the motion, so what is left is only the hand-over.
     static let stillIn = 0.3, stillLeave = 1.0, stillOut = 0.3
+    /// How long macOS takes to give a new window its space; then, when that
+    /// is another one, how long the switch there may take, and a beat after
+    /// it for the slide between spaces to end.
+    static let placed = 0.2, arrival = 2.0, slide = 0.25
 
     private static var shown: Showing?
     /// Whether the splash is still standing in for the main window.
@@ -52,7 +62,39 @@ enum Splash {
               let main = NSApp.windows.first(where: { $0.identifier?.rawValue.contains("main") == true }),
               main.isVisible, let screen = main.screen ?? NSScreen.main else { return }
         cover.covering = true
-        shown = Showing(main: main, screen: screen)
+        // Unseen by its alpha, and deaf to the clicks aimed at the flake, but
+        // left ordered in: ordered out and back, the window lost its sheets
+        // to another desktop. The sign-in sheet opened out of sight, still
+        // attached (Escape reached it), so the sign-in waited on a page no
+        // one could see.
+        main.alphaValue = 0
+        main.ignoresMouseEvents = true
+        // Coming forward is what takes you to the window's space, when it is
+        // on another one; on the space in front of you it changes nothing.
+        NSApp.activate(ignoringOtherApps: true)
+        main.makeKeyAndOrderFront(nil)
+        Task { @MainActor in
+            // A new window counts as on the space in front of you until macOS
+            // has placed it, a moment later: from a full-screen app, on a desktop.
+            try? await Task.sleep(for: .seconds(placed))
+            if !main.isOnActiveSpace {
+                AppLog.write("splash: the window is on another space; waiting to get there")
+                let asked = Date()
+                while !main.isOnActiveSpace, Date().timeIntervalSince(asked) < arrival {
+                    try? await Task.sleep(for: .milliseconds(50))
+                }
+                guard main.isOnActiveSpace else {
+                    // Spaces set not to follow an app (Desktop & Dock): the
+                    // window stays where it opened, shown at once, with no splash.
+                    AppLog.write("splash: no switch to the window's space; shown without it")
+                    main.alphaValue = 1
+                    main.ignoresMouseEvents = false
+                    return done()
+                }
+                try? await Task.sleep(for: .seconds(slide))
+            }
+            shown = Showing(main: main, screen: screen)
+        }
     }
 
     fileprivate static func done() {
@@ -74,13 +116,6 @@ enum Splash {
             // there: SwiftUI puts it back where it was last left.
             let s = screen.frame, f = main.frame
             model = SplashModel(anchor: CGPoint(x: f.midX - s.minX, y: s.maxY - f.midY), still: still)
-            // Unseen by its alpha, and deaf to the clicks aimed at the flake, but
-            // left ordered in: ordered out and back, the window lost its sheets
-            // to another desktop. The sign-in sheet opened out of sight, still
-            // attached (Escape reached it), so the sign-in waited on a page no
-            // one could see.
-            main.alphaValue = 0
-            main.ignoresMouseEvents = true
 
             panel = NSPanel(contentRect: s, styleMask: [.borderless, .nonactivatingPanel],
                             backing: .buffered, defer: false)
@@ -89,7 +124,8 @@ enum Splash {
             panel.hasShadow = false
             panel.ignoresMouseEvents = true
             panel.level = .floating
-            panel.collectionBehavior = [.transient, .ignoresCycle, .fullScreenAuxiliary]
+            // Never over a full-screen app: the window it opens out to can't be there.
+            panel.collectionBehavior = [.transient, .ignoresCycle]
             panel.isReleasedWhenClosed = false
             panel.contentView = NSHostingView(rootView: SplashView(model: model))
             panel.setFrame(s, display: false)

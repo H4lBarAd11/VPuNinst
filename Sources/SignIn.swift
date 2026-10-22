@@ -331,6 +331,12 @@ struct SignInWebView: NSViewRepresentable {
     /// Lets go of an institution's store; WebKit deletes only one not in use.
     static func release(_ i: Institution) { stores[i.dataStoreID] = nil }
 
+    /// Deletes what an institution's sign-in pages kept, cookies held only
+    /// in memory included, so the next sign-in starts at the first page.
+    static func forget(_ i: Institution) async {
+        await store(i).removeData(ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(), modifiedSince: .distantPast)
+    }
+
     func makeNSView(context: Context) -> WKWebView { page.view }
 
     func updateNSView(_ v: WKWebView, context: Context) {}

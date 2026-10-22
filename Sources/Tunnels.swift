@@ -82,6 +82,10 @@ final class Tunnels: ObservableObject {
     }
     /// Institutions with a helper call in flight: the watcher leaves them be.
     private var busy = Set<String>()
+    /// Institutions whose session ended without being disconnected, until
+    /// the next sign-in to them: that one is first tried out of sight (see
+    /// `begin`), whether the app starts it or you do.
+    private var ended = Set<String>()
     private var timer: Timer?
     private let path = NWPathMonitor()
     /// The look at the Mac in progress, if any. One can take a while, and the
@@ -163,6 +167,7 @@ final class Tunnels: ObservableObject {
         if list != institutions { institutions = list }
         for id in Set(status.keys).subtracting(list.map(\.id)) { status[id] = nil }
         wanted.formIntersection(list.map(\.id))
+        ended.formIntersection(list.map(\.id))
 
         let ids = list.map(\.id)
         let seen = await Task.detached { Dictionary(uniqueKeysWithValues: ids.map { ($0, Probe.tunnel($0)) }) }.value
@@ -200,6 +205,7 @@ final class Tunnels: ObservableObject {
                 let was = self[id].state
                 if [.connected, .reconnecting].contains(was) || (was == .checking && wanted.contains(id)) {
                     dropped.append(id)
+                    ended.insert(id)
                 }
                 forgetLatency(id)
                 update(id) { s in
@@ -275,15 +281,45 @@ final class Tunnels: ObservableObject {
             // The sign-in starts by looking up the gateway, which a network
             // whose saved DNS only a tunnel answers would fail.
             if !(await Task.detached { Probe.strandedDNS() }.value).isEmpty { await repair() }
-            do {
-                let r = try await SignIn.start(i)
-                // Removed or disconnected while the gateway was asked.
-                guard self[id].state == .signingIn else { return }
+            await begin(i, quietly: auto || ended.contains(id))
+        }
+    }
+
+    /// A session that ended may have been ended by the institution, which
+    /// leaves its identity provider remembering a sign-in it no longer
+    /// honours: the page skips to a later step, a second factor say, that
+    /// then fails. So the sign-in after one loads `quietly`, out of sight,
+    /// and if it doesn't end by itself starts over from its first page (see
+    /// `afresh`).
+    private func begin(_ i: Institution, quietly: Bool) async {
+        let id = i.id
+        do {
+            let r = try await SignIn.start(i)
+            // Removed or disconnected while the gateway was asked.
+            guard self[id].state == .signingIn else { return }
+            if quietly {
+                pages[r.id] = page(r, needsYou: { [weak self] in self?.afresh($0) })
+            } else {
                 queue.append(r)
                 showNextSignIn()
-            } catch {
-                update(id) { $0.state = .disconnected; $0.problem = error.localizedDescription }
             }
+        } catch {
+            update(id) { $0.state = .disconnected; $0.problem = error.localizedDescription }
+        }
+    }
+
+    /// A sign-in after a session ended that waits for you: what the
+    /// institution's sign-in pages kept is deleted, the identity provider's
+    /// session with it, and the sign-in begins again, shown.
+    private func afresh(_ r: SignInRequest) {
+        guard end(r) else { return }
+        let i = r.institution
+        AppLog.write("sign-in to \(i.id) after its session ended waits for you: signing in afresh")
+        Task {
+            await SignInWebView.forget(i)
+            ended.remove(i.id)
+            guard self[i.id].state == .signingIn else { return }
+            await begin(i, quietly: false)
         }
     }
 
@@ -297,12 +333,13 @@ final class Tunnels: ObservableObject {
 
     func page(for r: SignInRequest) -> SignInWebView.Page? { pages[r.id] }
 
-    /// `outOfSight` loads the page without showing it, until it waits for you.
-    private func page(_ r: SignInRequest, outOfSight: Bool = false) -> SignInWebView.Page {
+    /// With `needsYou`, the page loads without being shown, and that is
+    /// called once it waits for you.
+    private func page(_ r: SignInRequest, needsYou: ((SignInRequest) -> Void)? = nil) -> SignInWebView.Page {
         SignInWebView.Page(request: r, remember: rememberPassword,
                            done: { [weak self] c in self?.signedIn(r, c) },
                            failed: { [weak self] m in self?.signInFailed(r, m) },
-                           needsYou: outOfSight ? { [weak self] in self?.show(r) } : nil)
+                           needsYou: needsYou.map { f in { f(r) } })
     }
 
     /// A sign-in loading out of sight that waits for you takes its turn in the sheet.
@@ -341,6 +378,7 @@ final class Tunnels: ObservableObject {
 
     func signedIn(_ r: SignInRequest, _ c: Credential) {
         guard end(r) else { return }
+        ended.remove(r.institution.id)
         showNextSignIn()
         let id = r.institution.id
         let user = c.username.flatMap { $0.isEmpty ? nil : $0 } ?? "-"
@@ -380,7 +418,7 @@ final class Tunnels: ObservableObject {
             guard self[id].state == .signingIn else { return }
             // The identity provider usually still knows you from the portal's
             // sign-in, so this one ends by itself: it is shown only if not.
-            pages[next.id] = page(next, outOfSight: true)
+            pages[next.id] = page(next, needsYou: { [weak self] in self?.show($0) })
         } catch {
             fail(error.localizedDescription)
         }

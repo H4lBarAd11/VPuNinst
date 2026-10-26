@@ -1,0 +1,39 @@
+When a Palo Alto tunnel's ESP stops answering, which is what sleep and a
+change of network do to it, openconnect falls back to an HTTPS tunnel with a
+single attempt, and quits if the network isn't back yet; it does the same
+when the hourly HIP check can't reconnect. With this, both go through the
+reconnect loop, which keeps trying for --reconnect-timeout and still ends at
+once when the gateway refuses the session or openconnect is told to stop.
+
+--- a/gpst.c
++++ b/gpst.c
+@@ -1154,8 +1154,11 @@
+ 		/* XX: gpst_connect does nothing if ESP is enabled and has secrets */
+ 		vpninfo->dtls_state = DTLS_NOSECRET;
+ 		if ((ret = gpst_connect(vpninfo))) {
+-			vpninfo->quit_reason = "GPST connect failed";
+-			return ret;
++			if (ret == -EPERM || ret == -EINTR) {
++				vpninfo->quit_reason = "GPST connect failed";
++				return ret;
++			}
++			goto do_reconnect;
+ 		}
+ 		break;
+ 	case DTLS_NOSECRET:
+@@ -1311,8 +1314,13 @@
+ 			return ret;
+ 		}
+ 		/* XX: no need to do_reconnect, since ESP doesn't need reconnection */
+-		if ((ret = gpst_connect(vpninfo)))
+-			vpninfo->quit_reason = "GPST connect failed";
++		if ((ret = gpst_connect(vpninfo))) {
++			if (ret == -EPERM || ret == -EINTR) {
++				vpninfo->quit_reason = "GPST connect failed";
++				return ret;
++			}
++			goto do_reconnect;
++		}
+ 		return ret;
+ 	}
+ 

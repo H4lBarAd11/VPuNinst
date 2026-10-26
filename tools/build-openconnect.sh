@@ -58,7 +58,8 @@ JOBS=$(sysctl -n hw.ncpu)
 # space in it, and a checkout's path may have one.
 CACHE="$(getconf DARWIN_USER_CACHE_DIR)vpuninst-openconnect"
 KEY="$OPENCONNECT-$(echo "$OPENCONNECT_SHA256" | cut -c1-12)-$OPENSSL-$(echo "$OPENSSL_SHA256" | cut -c1-12)"
-STAMP="$KEY $ARCHS $(shasum -a 256 < "$SCRIPT" | cut -c1-64)"
+PATCH="$TOP/tools/openconnect-gp-reconnect.patch"
+STAMP="$KEY $ARCHS $(shasum -a 256 < "$SCRIPT" | cut -c1-64) $(shasum -a 256 < "$PATCH" | cut -c1-64)"
 FRESH=no
 [ "${1:-}" = --fresh ] && FRESH=yes
 if [ $FRESH = yes ]; then
@@ -145,6 +146,11 @@ EOF
   # static libraries, so those are what is linked.
   OC="$D/openconnect-$OPENCONNECT"
   tar -xzf "$WORK/openconnect-$OPENCONNECT.tar.gz" -C "$D"
+  # Keeps a Palo Alto tunnel up across sleep (see the patch). A version it
+  # no longer applies to stops the build, to be looked at again. Patched, the
+  # version string is made again, by a script that takes the RPM_PACKAGE_*
+  # variables below: it then reads v<version>-vpuninst, not -unknown.
+  patch -s -p1 -d "$OC" < "$PATCH" || { echo "the patch doesn't apply to openconnect $OPENCONNECT" >&2; exit 1; }
   (cd "$OC" &&
     ./configure --quiet ${HOST:+--host=$HOST} --disable-shared --enable-static --disable-nls \
       --without-gnutls --with-builtin-json --without-gssapi \
@@ -156,7 +162,7 @@ EOF
       OPENSSL_CFLAGS="-I$STAGE/include" OPENSSL_LIBS="-L$STAGE/lib -lssl -lcrypto" \
       LIBXML2_CFLAGS="-I$SDK/usr/include/libxml2" LIBXML2_LIBS="-lxml2" \
       ZLIB_CFLAGS="" ZLIB_LIBS="-lz" &&
-    make -j"$JOBS") >"$D/openconnect.log" 2>&1 || { tail -30 "$D/openconnect.log" >&2; exit 1; }
+    RPM_PACKAGE_VERSION=$OPENCONNECT RPM_PACKAGE_RELEASE=vpuninst make -j"$JOBS") >"$D/openconnect.log" 2>&1 || { tail -30 "$D/openconnect.log" >&2; exit 1; }
   cp "$OC/openconnect" "$D/openconnect"
   strip -x "$D/openconnect"
 }
@@ -172,6 +178,7 @@ FIRST=$(echo $ARCHS | cut -d' ' -f1)
 cp "$WORK/$FIRST/openconnect-$OPENCONNECT/trojans/hipreport.sh" "$OUT/hipreport.sh"
 chmod 0755 "$OUT/openconnect" "$OUT/hipreport.sh"
 cp "$WORK/$FIRST/openconnect-$OPENCONNECT/COPYING.LGPL" "$OUT/licenses/openconnect-LGPL-2.1.txt"
+cp "$PATCH" "$OUT/licenses/openconnect-gp-reconnect.patch"
 cp "$WORK/$FIRST/openssl-$OPENSSL/LICENSE.txt" "$OUT/licenses/OpenSSL-Apache-2.0.txt"
 
 # The binary must be for every architecture, report the versions it was
@@ -205,6 +212,7 @@ from these sources:
 
 https://www.infradead.org/openconnect/download/openconnect-$OPENCONNECT.tar.gz
   SHA-256 $OPENCONNECT_SHA256
+  changed by openconnect-gp-reconnect.patch, beside this file
 https://github.com/openssl/openssl/releases/download/openssl-$OPENSSL/openssl-$OPENSSL.tar.gz
   SHA-256 $OPENSSL_SHA256
 

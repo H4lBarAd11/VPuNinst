@@ -411,6 +411,7 @@ struct SignInWebView: NSViewRepresentable {
         /// Ends the page: nothing more is reported, and the message handler,
         /// which the content controller holds strongly, is let go.
         func close() {
+            if !finished { trace("closed") }
             finished = true
             needsYou = nil
             waiting?.cancel()
@@ -421,6 +422,7 @@ struct SignInWebView: NSViewRepresentable {
         /// Shows a page that was loading out of sight, once.
         private func reveal() {
             guard !finished, let n = needsYou else { return }
+            trace("waits for you at \(Self.place(view.url))")
             needsYou = nil
             waiting?.cancel()
             n()
@@ -512,7 +514,43 @@ struct SignInWebView: NSViewRepresentable {
             })(\(args), \(submit));
             """
             w.evaluateJavaScript(js, in: nil, in: SignInWebView.world) { [weak self] res in
-                if case .success(let v) = res, (v as? Bool) == true, submit { self?.submitted = true }
+                guard case .success(let v) = res, (v as? Bool) == true else { return }
+                self?.trace(submit ? "filled in the saved sign-in and sent it" : "filled in the saved sign-in")
+                if submit { self?.submitted = true }
+            }
+        }
+
+        /// The cookies the last page's host held, by name, as last logged.
+        private var cookieNames: [String]?
+
+        /// A sign-in's steps go to the log, so that one that fails can be
+        /// followed afterwards: each page's address without its query, but
+        /// for the step a sign-in flow numbers there, its title, and the
+        /// names of its host's cookies when they change. Never a value.
+        private func trace(_ what: String) {
+            let to = request.gateway.map { " at \($0)" } ?? ""
+            let hidden = needsYou != nil ? ", out of sight" : ""
+            AppLog.write("sign-in \(request.id.uuidString.prefix(4)) to \(institution.id)\(to)\(hidden): \(what)")
+        }
+
+        private static func place(_ u: URL?) -> String {
+            guard let u, let c = URLComponents(url: u, resolvingAgainstBaseURL: false) else { return "-" }
+            let step = c.queryItems?.first { $0.name == "execution" }?.value.map { "?execution=\($0)" } ?? ""
+            return "\(c.host ?? "-")\(c.path)\(step)"
+        }
+
+        private func traceLoaded(_ w: WKWebView) {
+            let page = w.url, title = w.title ?? ""
+            w.configuration.websiteDataStore.httpCookieStore.getAllCookies { [weak self] cookies in
+                guard let self else { return }
+                let host = page?.host?.lowercased() ?? ""
+                let names = cookies.filter { c in
+                    let d = c.domain.lowercased().drop { $0 == "." }
+                    return host == d || host.hasSuffix("." + d)
+                }.map(\.name).sorted()
+                let changed = names != self.cookieNames
+                self.cookieNames = names
+                self.trace("loaded “\(title)” at \(Self.place(page))" + (changed ? ", cookies: \(names.isEmpty ? "none" : names.joined(separator: " "))" : ""))
             }
         }
 
@@ -537,6 +575,9 @@ struct SignInWebView: NSViewRepresentable {
 
         func webView(_ w: WKWebView, decidePolicyFor r: WKNavigationResponse,
                      decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void) {
+            if r.isForMainFrame, let h = r.response as? HTTPURLResponse {
+                trace("\(h.statusCode) from \(Self.place(h.url))")
+            }
             if case .paloAlto(let portal) = request.finish, r.isForMainFrame, isGateway(r.response.url),
                let h = r.response as? HTTPURLResponse {
                 let get = { (name: String) in h.value(forHTTPHeaderField: name).flatMap { $0.isEmpty || $0 == "empty" ? nil : $0 } }
@@ -546,14 +587,21 @@ struct SignInWebView: NSViewRepresentable {
         }
 
         func webView(_ w: WKWebView, didFinish nav: WKNavigation!) {
+            traceLoaded(w)
             fill(w)
             check(w)
             if needsYou != nil { lookForYou(w) }
         }
 
         // Cisco's final address need not be a page that loads.
-        func webView(_ w: WKWebView, didFail nav: WKNavigation!, withError e: Error) { check(w) }
-        func webView(_ w: WKWebView, didFailProvisionalNavigation nav: WKNavigation!, withError e: Error) { check(w) }
+        func webView(_ w: WKWebView, didFail nav: WKNavigation!, withError e: Error) {
+            trace("failed at \(Self.place(w.url)): \(e.localizedDescription)")
+            check(w)
+        }
+        func webView(_ w: WKWebView, didFailProvisionalNavigation nav: WKNavigation!, withError e: Error) {
+            trace("failed on the way from \(Self.place(w.url)): \(e.localizedDescription)")
+            check(w)
+        }
 
         private func paloAlto(_ get: (String) -> String?, portal: Bool) -> Credential? {
             let user = get("saml-username")

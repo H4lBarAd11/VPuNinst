@@ -111,9 +111,25 @@ final class Tunnels: ObservableObject {
         NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
             Task { @MainActor in
+                self?.back()
                 try? await Task.sleep(for: .seconds(4))
                 await self?.tick()
             }
+        }
+        // The other ways of coming back to a sign-in that waited (see `back`):
+        // the screen lighting up, unlocking, the window coming into view.
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.screensDidWakeNotification, object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in self?.back() }
+        }
+        DistributedNotificationCenter.default().addObserver(
+            forName: Notification.Name("com.apple.screenIsUnlocked"), object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in self?.back() }
+        }
+        NotificationCenter.default.addObserver(
+            forName: NSWindow.didChangeOcclusionStateNotification, object: nil, queue: .main) { [weak self] n in
+            guard (n.object as? NSWindow)?.occlusionState.contains(.visible) == true else { return }
+            Task { @MainActor in self?.back() }
         }
         // A network coming back is the moment a wanted-but-dropped tunnel can
         // be retried; an earlier attempt may have failed for want of one.
@@ -313,11 +329,35 @@ final class Tunnels: ObservableObject {
     /// session with it, and the sign-in begins again, shown.
     private func afresh(_ r: SignInRequest) {
         guard end(r) else { return }
-        let i = r.institution
-        AppLog.write("sign-in to \(i.id) after its session ended waits for you: signing in afresh")
+        AppLog.write("sign-in to \(r.institution.id) after its session ended waits for you: signing in afresh")
+        ended.remove(r.institution.id)
+        startOver(r.institution)
+    }
+
+    /// A page that waits for you keeps for a few minutes at most: an identity
+    /// provider lets the step it is at lapse, a second factor's say, and then
+    /// turns the code down or goes back to its first page. A session ends
+    /// while the Mac sleeps as readily as while you work, and the sign-in
+    /// after it runs on a wake with the lid shut: its page is waiting long
+    /// before you see it. So, back at the Mac, a sign-in on show that waited
+    /// meanwhile is begun again, from a page that is fresh when you reach it.
+    /// The page keeps for at least as long as you take to type a code, so a
+    /// short absence is left alone, and only an absence counts: switching
+    /// to an authenticator app and back is not one.
+    private static let lapse: TimeInterval = 30
+
+    private func back() {
+        guard let r = signIn, let p = pages[r.id], p.waited > Self.lapse else { return }
+        AppLog.write("sign-in to \(r.institution.id) waited \(Int(p.waited)) s while you were away: signing in afresh")
+        guard end(r) else { return }
+        startOver(r.institution)
+    }
+
+    /// The sign-in begins again, shown: what the institution's sign-in pages
+    /// kept is deleted, the identity provider's session with it.
+    private func startOver(_ i: Institution) {
         Task {
             await SignInWebView.forget(i)
-            ended.remove(i.id)
             guard self[i.id].state == .signingIn else { return }
             await begin(i, quietly: false)
         }

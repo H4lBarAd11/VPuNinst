@@ -362,6 +362,10 @@ struct SignInWebView: NSViewRepresentable {
         var submitted = false
         /// Cisco's token, from the moment its cookie appears.
         var token: String?
+        /// When the page last finished loading, or was made.
+        private var loaded = Date()
+        /// How long the page has waited as it stands, with nothing loading.
+        var waited: TimeInterval { view.isLoading ? 0 : Date().timeIntervalSince(loaded) }
         /// The saved sign-in, read once per sign-in and off the main thread.
         /// After a rebuild the keychain asks before handing it over, and read
         /// on the main thread that froze the whole app until the dialog was
@@ -587,6 +591,7 @@ struct SignInWebView: NSViewRepresentable {
         }
 
         func webView(_ w: WKWebView, didFinish nav: WKNavigation!) {
+            loaded = Date()
             traceLoaded(w)
             fill(w)
             check(w)
@@ -595,6 +600,7 @@ struct SignInWebView: NSViewRepresentable {
 
         // Cisco's final address need not be a page that loads.
         func webView(_ w: WKWebView, didFail nav: WKNavigation!, withError e: Error) {
+            loaded = Date()
             trace("failed at \(Self.place(w.url)): \(e.localizedDescription)")
             check(w)
         }

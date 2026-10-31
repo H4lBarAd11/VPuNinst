@@ -31,8 +31,8 @@ with something like `10.x.x.x`. Keep the error messages as they are.
 ## Reporting a bug
 
 Use the **Bug** form, with your macOS version, whether the Mac has Apple
-silicon or Intel, VPuNinst’s version (at the foot of its window), what you
-did and what happened. The same care with logs applies.
+silicon or Intel, VPuNinst’s version (in About VPuNinst, in the snowflake’s
+menu), what you did and what happened. The same care with logs applies.
 
 A security problem goes in a private report, never an issue. See
 [SECURITY.md](SECURITY.md).

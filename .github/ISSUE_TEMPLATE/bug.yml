@@ -41,8 +41,8 @@ body:
     id: version
     attributes:
       label: VPuNinst version
-      description: At the foot of the window.
-      placeholder: "2.0"
+      description: In About VPuNinst, in the snowflake’s menu.
+      placeholder: "2.1"
     validations:
       required: true
   - type: dropdown

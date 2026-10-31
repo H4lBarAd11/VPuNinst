@@ -10,8 +10,16 @@ struct VPuNinstApp: App {
         Window(Brand.name, id: "main") {
             MainView().environmentObject(vpn)
         }
+        // No title: the window buttons stand in a strip of their own, centred
+        // in it as the unified toolbar does. The version is in About.
         .windowStyle(.hiddenTitleBar)
+        .windowToolbarStyle(.unified(showsTitle: false))
         .windowResizability(.contentSize)
+
+        // Opened from the menu-bar item; the app has no menu bar of its own.
+        Settings {
+            SettingsView().environmentObject(vpn)
+        }
 
         MenuBarExtra {
             MenuContent().environmentObject(vpn)

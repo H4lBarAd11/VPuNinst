@@ -16,7 +16,7 @@ struct MainView: View {
     var body: some View {
         VStack(spacing: 0) {
             header
-                .padding(.top, 34)
+                .padding(.top, 4)
                 .padding(.bottom, 22)
             VStack(spacing: 12) {
                 if !vpn.helperReady { SetupCard() }
@@ -29,17 +29,15 @@ struct MainView: View {
                     addButton
                 }
                 if let p = vpn.problem { ProblemNote(text: p) }
-                options
-                    .padding(.top, 2)
             }
             .padding(.horizontal, 24)
-            Spacer(minLength: 18)
-            signature
+            .padding(.bottom, 24)
         }
         .frame(width: 420)
         .fixedSize(horizontal: false, vertical: true)
         .background(Theme.ivory)
         .preferredColorScheme(.light)
+        .toolbar { WindowStrip() }
         .sheet(item: $form) { t in
             InstitutionForm(original: { if case .edit(let i) = t { return i }; return nil }())
                 .environmentObject(vpn)
@@ -94,8 +92,30 @@ struct MainView: View {
         .disabled(!vpn.helperReady)
         .opacity(vpn.helperReady ? 1 : 0.45)
     }
+}
 
-    private var options: some View {
+/// The unified toolbar's strip comes with a toolbar, and SwiftUI makes one
+/// only for an item: this one holds the strip open, and shows nothing.
+struct WindowStrip: ToolbarContent {
+    var body: some ToolbarContent {
+        if #available(macOS 26, *) {
+            // Each item stands on a glass capsule, drawn even round nothing.
+            ToolbarItem { placeholder }.sharedBackgroundVisibility(.hidden)
+        } else {
+            ToolbarItem { placeholder }
+        }
+    }
+
+    private var placeholder: some View {
+        Color.clear.frame(width: 1, height: 1).accessibilityHidden(true)
+    }
+}
+
+/// The options, in the Settings window.
+struct SettingsView: View {
+    @EnvironmentObject var vpn: Tunnels
+
+    var body: some View {
         VStack(spacing: 0) {
             OptionRow(title: "Keep connected",
                       detail: "Sign in again when a session ends",
@@ -115,18 +135,46 @@ struct MainView: View {
         }
         .padding(.horizontal, 14)
         .background(Theme.card, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .padding(20)
+        .frame(width: 420)
+        .fixedSize(horizontal: false, vertical: true)
+        .background(Theme.ivory)
+        .preferredColorScheme(.light)
+        .modifier(Untitled())
     }
 
-    private var signature: some View {
-        VStack(spacing: 3) {
-            Rectangle().fill(Theme.hairline).frame(height: 1).padding(.bottom, 12)
-            Text("Riccardo Nevoso").house(13, .medium)
-            Text("\(Brand.name) \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "")")
-                .house(10.5, .regular, Theme.inkSoft)
-            Text("Independent · not affiliated with any institution · no warranty")
-                .house(10.5, .regular, Theme.inkSoft)
+    /// No title, and the ivory up through the title bar, as in the main
+    /// window. A Settings window takes no window style and always has the
+    /// tall preferences toolbar, so this one is given no toolbar: the plain
+    /// bar, as on the About panel. Before macOS 15 it keeps its title.
+    private struct Untitled: ViewModifier {
+        func body(content: Content) -> some View {
+            if #available(macOS 15, *) {
+                content
+                    .toolbar(removing: .title)
+                    .toolbarBackground(.hidden, for: .windowToolbar)
+                    .containerBackground(Theme.ivory, for: .window)
+            } else {
+                content
+            }
         }
-        .padding(.bottom, 16)
+    }
+}
+
+/// The standard About panel: the icon, name, version and build, and the
+/// copyright line from Info.plist, with the app's standing as credits.
+@MainActor
+enum About {
+    static func show() {
+        let centred = NSMutableParagraphStyle()
+        centred.alignment = .center
+        let credits = NSAttributedString(
+            string: "Independent · not affiliated with any institution\nNo warranty",
+            attributes: [.font: NSFont.systemFont(ofSize: NSFont.smallSystemFontSize),
+                         .foregroundColor: NSColor.secondaryLabelColor,
+                         .paragraphStyle: centred])
+        NSApp.activate(ignoringOtherApps: true)
+        NSApp.orderFrontStandardAboutPanel(options: [.credits: credits])
     }
 }
 
@@ -505,6 +553,7 @@ struct LoginSheet: View {
 struct MenuContent: View {
     @EnvironmentObject var vpn: Tunnels
     @Environment(\.openWindow) private var openWindow
+    @Environment(\.openSettings) private var openSettings
     var body: some View {
         let up = vpn.institutions.filter { vpn[$0.id].isUp }.count
         Text(up == 0 ? "\(Brand.name) — Not connected" : "\(Brand.name) — \(up) connected")
@@ -520,6 +569,10 @@ struct MenuContent: View {
         }
         Divider()
         Button("Open \(Brand.name)…") { openWindow(id: "main"); NSApp.activate(ignoringOtherApps: true) }
+        // Activated first: an app with no Dock icon otherwise opens it behind.
+        Button("Settings…") { NSApp.activate(ignoringOtherApps: true); openSettings() }
+            .keyboardShortcut(",")
+        Button("About \(Brand.name)") { About.show() }
         // Only once every tunnel is down: quitting would leave tunnels nobody watches.
         if vpn.allIdle {
             Divider()

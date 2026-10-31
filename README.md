@@ -149,7 +149,7 @@ deletes its saved password and its sign-in cookies.
 ```sh
 git clone https://github.com/H4lBarAd11/VPuNinst.git && cd VPuNinst
 sh tools/make-signing-cert.sh   # once: a local certificate to sign the app with
-./build.sh install              # → ~/Applications/VPuNinst.app
+./build.sh install              # → /Applications/VPuNinst.app
 ```
 
 Apple’s developer tools are all it needs. The first build also fetches
@@ -182,9 +182,12 @@ sudo visudo -cf /tmp/vpuninst.sudoers && sudo install -o root -g wheel -m 0440 /
 helper or the tunnel script, reinstall them with step 1; after a new
 openconnect build, repeat step 2. If the openconnect installed isn’t the one
 the app was built with, the window says so.
-Built this way, the app lives in `~/Applications`, where the package doesn’t
-touch it. Keep one copy or the other: two would each watch and repair the
-same tunnels.
+Built this way, the app goes to `/Applications`, where the package puts it
+too, so there is only ever one copy: two would each watch and repair the
+same tunnels. Replacing the package’s copy, which belongs to root, asks for
+your password. The install moves the build out of `build/`, so Spotlight
+doesn’t list it, removes any copy in `~/Applications`, and names any other
+copy it finds.
 
 **Releasing.** Raise `VERSION`, commit and push, then run
 `sh packaging/release.sh`. It first checks that openconnect and OpenSSL are
@@ -361,7 +364,8 @@ one down undoes exactly that:
   every rebuild. Switching between the package and your own builds counts as
   a change of signature. The app keeps working while the dialog
   waits, so you can also type the password into the page yourself.
-- **Removing them:** turning off **Remember passwords** deletes them all;
+- **Removing them:** turning off **Remember passwords** (in **Settings…**,
+  in the snowflake’s menu) deletes them all;
   removing an institution deletes its own. You can also delete them in
   Keychain Access.
 

@@ -1,7 +1,7 @@
 #!/bin/sh
 # Copyright (c) 2026 Riccardo Nevoso. GPL-3.0-or-later; see LICENSE.
-# Builds build/VPuNinst.app. `./build.sh install` also copies it to
-# ~/Applications; `./build.sh pkg` also makes the installer,
+# Builds build/VPuNinst.app. `./build.sh install` also puts it in
+# /Applications; `./build.sh pkg` also makes the installer,
 # build/VPuNinst-<version>.pkg (see packaging/).
 set -eu
 cd "$(dirname "$0")"
@@ -56,10 +56,44 @@ else
   echo "built $APP, signed ad hoc (no \"$SIGN\"; see tools/make-signing-cert.sh)"
 fi
 
+# One copy only, in /Applications where the package puts it too: two copies
+# would each watch and repair the same tunnels. The package's copy belongs to
+# root, so replacing it goes through sudo.
 if [ "${1:-}" = install ]; then
-  rm -rf "$HOME/Applications/VPuNinst.app"
-  cp -R "$APP" "$HOME/Applications/"
-  echo "installed to ~/Applications"
+  DEST=/Applications/VPuNinst.app
+  AS=
+  if [ ! -w /Applications ] || { [ -e "$DEST" ] && [ -n "$(find "$DEST" ! -user "$(id -u)" -print -quit)" ]; }; then
+    AS=sudo
+  fi
+  $AS rm -rf "$DEST"
+  $AS ditto "$APP" "$DEST"
+  # Moved rather than copied: left in build/, Spotlight lists it as an app.
+  rm -rf "$APP"
+  echo "installed to $DEST"
+
+  # Every other copy macOS knows of: the one in ~/Applications goes, copies
+  # already gone or in the Trash leave the app list, and any other is named
+  # for you to remove. LaunchServices forgets a copy while it is still there.
+  LSR=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
+  OLD="$HOME/Applications/VPuNinst.app"
+  if [ -e "$OLD" ]; then
+    "$LSR" -u "$OLD"
+    rm -rf "$OLD"
+  fi
+  "$LSR" -dump 2>/dev/null |
+    awk '/^path:/ { sub(/^path: */, ""); sub(/ \(0x[0-9a-f]+\)$/, ""); p = $0 }
+         /^identifier:/ && $2 == "io.github.h4lbarad11.vpuninst" { print p }' |
+    sort -u | while IFS= read -r P; do
+      [ "$P" = "$DEST" ] && continue
+      if [ -e "$P" ] && case "$P" in */.Trash/*) false ;; esac; then
+        echo "another copy is at $P: remove it" >&2
+      else
+        "$LSR" -u "$P" >/dev/null 2>&1 || true
+      fi
+    done
+  if pgrep -qx VPuNinst; then
+    echo "VPuNinst is running: quit it from the snowflake's menu and open it again"
+  fi
 fi
 
 # The installer: the app for /Applications, and a postinstall that does the
